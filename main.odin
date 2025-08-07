@@ -252,15 +252,20 @@ scanner_string :: proc(s: ^Scanner) {
 }
 
 scanner_multiline_comment :: proc(s: ^Scanner) {
-	for scanner_peek(s) != '*' && scanner_peek_next(s) != '/' && !scanner_is_eof(s) {
-		if scanner_peek(s) == '\n' {
+	depth := 1
+	for depth > 0 {
+		if scanner_is_eof(s) {
+			break
+		} else if scanner_peek(s) == '/' && scanner_peek_next(s) == '*' {
+			depth += 1
+			scanner_advance(s)
+		} else if scanner_peek(s) == '*' && scanner_peek_next(s) == '/' {
+			depth -= 1
+			scanner_advance(s)
+		} else if scanner_peek(s) == '\n' {
 			s.line += 1
 		}
 		scanner_advance(s)
-	}
-	if !scanner_is_eof(s) {
-		scanner_advance(s) // eat *
-		scanner_advance(s) // eat /
 	}
 }
 
