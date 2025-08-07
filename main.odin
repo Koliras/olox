@@ -4,6 +4,7 @@ import "core:bufio"
 import "core:fmt"
 import "core:io"
 import os "core:os/os2"
+import "core:strconv"
 import "core:strings"
 
 had_error := false
@@ -21,7 +22,6 @@ main :: proc() {
 }
 
 run_file :: proc(fpath: string) {
-	fmt.println(fpath)
 	f, ferr := os.open(fpath)
 	if ferr != nil {
 		fmt.printfln("Could not open %s file. Error %s received", fpath, ferr)
@@ -66,8 +66,9 @@ run_prompt :: proc() {
 }
 
 run_code :: proc(code: string) {
-	fmt.println(code)
-	scanner := Scanner{code}
+	scanner := Scanner {
+		src = code,
+	}
 	tokens := scanner_scan_tokens(&scanner)
 
 	for token in tokens {
@@ -76,11 +77,28 @@ run_code :: proc(code: string) {
 }
 
 Scanner :: struct {
-	src: string,
+	src:       string,
+	tokens:    [dynamic]Token,
+	pos:       int,
+	line:      int,
+	lex_start: int,
+}
+
+scanner_is_eof :: proc(s: ^Scanner) -> bool {
+	return len(s.src) <= s.pos
 }
 
 Token :: struct {
-	kind: Token_Kind,
+	kind:    Token_Kind,
+	lexeme:  string,
+	line:    int,
+	literal: Token_Literal,
+}
+
+Token_Literal :: union {
+	string,
+	bool,
+	f64,
 }
 
 Token_Kind :: enum u8 {
@@ -134,8 +152,201 @@ Token_Kind :: enum u8 {
 	EOF,
 }
 
-scanner_scan_tokens :: proc(scanner: ^Scanner) -> []Token {
-	return {}
+scanner_scan_tokens :: proc(s: ^Scanner) -> [dynamic]Token {
+	if s.tokens == nil {
+		s.tokens = make([dynamic]Token)
+	}
+	for !scanner_is_eof(s) {
+		s.lex_start = s.pos
+		scanner_scan_token(s)
+	}
+	append(&s.tokens, Token{line = s.line, kind = .EOF})
+	return s.tokens
+}
+
+scanner_advance :: proc(s: ^Scanner) -> byte {
+	cur := s.src[s.pos]
+	s.pos += 1
+	return cur
+}
+
+scanner_scan_token :: proc(s: ^Scanner) {
+	c := scanner_advance(s)
+
+	switch c {
+	case '(':
+		scanner_add_token(s, .Left_Paren)
+	case ')':
+		scanner_add_token(s, .Right_Paren)
+	case '{':
+		scanner_add_token(s, .Left_Brace)
+	case '}':
+		scanner_add_token(s, .Right_Brace)
+	case ',':
+		scanner_add_token(s, .Comma)
+	case '.':
+		next := scanner_peek(s)
+		if next >= '0' && next <= '9' {
+			report(s.line, "Leading dot before number")
+			return
+		}
+		scanner_add_token(s, .Dot)
+	case '-':
+		scanner_add_token(s, .Minus)
+	case '+':
+		scanner_add_token(s, .Plus)
+	case ';':
+		scanner_add_token(s, .Semicolon)
+	case '*':
+		scanner_add_token(s, .Star)
+	case '/':
+		if scanner_peek(s) == '/' {
+			for scanner_peek(s) != '\n' && !scanner_is_eof(s) {
+				scanner_advance(s)
+			}
+		} else {
+			scanner_add_token(s, .Slash)
+		}
+	case '\n':
+		s.line += 1
+	case ' ', '\t', '\r':
+	case '"':
+		scanner_string(s)
+	case '0' ..= '9':
+		scanner_number(s)
+	case '=':
+		scanner_add_token(s, scanner_match(s, '=') ? .Equal_Equal : .Equal)
+	case '!':
+		scanner_add_token(s, scanner_match(s, '=') ? .Bang_Equal : .Bang)
+	case '<':
+		scanner_add_token(s, scanner_match(s, '=') ? .Less_Equal : .Less)
+	case '>':
+		scanner_add_token(s, scanner_match(s, '=') ? .Greater_Equal : .Greater)
+	case:
+		if is_alpha(c) {
+			scanner_identifier(s)
+		} else {
+			report(s.line, fmt.tprintf("Unexpected character. %s", s.pos))
+		}
+	}
+}
+
+scanner_string :: proc(s: ^Scanner) {
+	for scanner_peek(s) != '"' && !scanner_is_eof(s) {
+		if scanner_peek(s) == '\n' {
+			s.line += 1
+		}
+		scanner_advance(s)
+	}
+
+	if scanner_is_eof(s) {
+		report(s.line, "Unterminated string.")
+		return
+	}
+	scanner_advance(s)
+
+	val := s.src[s.lex_start + 1:s.pos - 1]
+	scanner_add_token(s, .String, val)
+}
+
+scanner_number :: proc(s: ^Scanner) {
+	for is_digit(scanner_peek(s)) {
+		scanner_advance(s)
+	}
+
+	if scanner_peek(s) == '.' && is_digit(scanner_peek_next(s)) {
+		scanner_advance(s)
+		for is_digit(scanner_peek(s)) {
+			scanner_advance(s)
+		}
+	}
+
+	str := s.src[s.lex_start:s.pos]
+	val, ok := strconv.parse_f64(str)
+	if !ok {
+		report(s.line, "Could not parse float number")
+	}
+	scanner_add_token(s, .Number, val)
+}
+
+is_digit :: #force_inline proc(c: byte) -> bool {
+	return c >= '0' && c <= '9'
+}
+is_alpha :: #force_inline proc(c: byte) -> bool {
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'
+}
+is_alpha_numeric :: proc(c: byte) -> bool {
+	return is_alpha(c) || is_digit(c)
+}
+
+scanner_identifier :: proc(s: ^Scanner) {
+	for is_alpha_numeric(scanner_peek(s)) {
+		scanner_advance(s)
+	}
+	text := s.src[s.lex_start:s.pos]
+	type := Token_Kind.Identifier
+	switch text {
+	case "or":
+		type = .Or
+	case "and":
+		type = .And
+	case "if":
+		type = .If
+	case "class":
+		type = .Class
+	case "else":
+		type = .Else
+	case "false":
+		type = .False
+	case "true":
+		type = .True
+	case "for":
+		type = .For
+	case "fun":
+		type = .Fun
+	case "nil":
+		type = .Nil
+	case "print":
+		type = .Print
+	case "return":
+		type = .Return
+	case "super":
+		type = .Super
+	case "this":
+		type = .This
+	case "var":
+		type = .Var
+	case "while":
+		type = .While
+	}
+	scanner_add_token(s, type)
+}
+
+scanner_add_simple_token :: proc(s: ^Scanner, kind: Token_Kind) {
+	append(&s.tokens, Token{kind = kind, line = s.line})
+}
+scanner_add_token_with_literal :: proc(s: ^Scanner, kind: Token_Kind, literal: Token_Literal) {
+	append(&s.tokens, Token{kind = kind, line = s.line, literal = literal})
+}
+scanner_add_token :: proc {
+	scanner_add_simple_token,
+	scanner_add_token_with_literal,
+}
+
+scanner_peek :: proc(s: ^Scanner) -> byte {
+	if scanner_is_eof(s) do return 0
+	return s.src[s.pos]
+}
+scanner_peek_next :: proc(s: ^Scanner) -> byte {
+	if s.pos + 1 >= len(s.src) do return 0
+	return s.src[s.pos + 1]
+}
+scanner_match :: proc(s: ^Scanner, expected: byte) -> bool {
+	if scanner_is_eof(s) do return false
+	if s.src[s.pos] != expected do return false
+
+	s.pos += 1
+	return true
 }
 
 report :: proc(line: int, message: string) {
