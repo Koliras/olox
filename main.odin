@@ -200,10 +200,12 @@ scanner_scan_token :: proc(s: ^Scanner) {
 	case '*':
 		scanner_add_token(s, .Star)
 	case '/':
-		if scanner_peek(s) == '/' {
+		if scanner_match(s, '/') {
 			for scanner_peek(s) != '\n' && !scanner_is_eof(s) {
 				scanner_advance(s)
 			}
+		} else if scanner_match(s, '*') {
+			scanner_multiline_comment(s)
 		} else {
 			scanner_add_token(s, .Slash)
 		}
@@ -247,6 +249,19 @@ scanner_string :: proc(s: ^Scanner) {
 
 	val := s.src[s.lex_start + 1:s.pos - 1]
 	scanner_add_token(s, .String, val)
+}
+
+scanner_multiline_comment :: proc(s: ^Scanner) {
+	for scanner_peek(s) != '*' && scanner_peek_next(s) != '/' && !scanner_is_eof(s) {
+		if scanner_peek(s) == '\n' {
+			s.line += 1
+		}
+		scanner_advance(s)
+	}
+	if !scanner_is_eof(s) {
+		scanner_advance(s) // eat *
+		scanner_advance(s) // eat /
+	}
 }
 
 scanner_number :: proc(s: ^Scanner) {

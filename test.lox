@@ -1,2 +1,11 @@
 var my_variable = 12
 while "string literla"
+/*
+my multiline comment
+/*
+nested comment 
+*/
+
+my first rank comment
+*/
+foo bar
