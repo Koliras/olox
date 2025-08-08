@@ -1,5 +1,9 @@
 var my_variable = 12
 while "string literla"
+
+"multiline
+text
+for test"
 /*
 my multiline comment
 /*

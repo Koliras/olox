@@ -234,6 +234,7 @@ scanner_scan_token :: proc(s: ^Scanner) {
 }
 
 scanner_string :: proc(s: ^Scanner) {
+	start_line := s.line
 	for scanner_peek(s) != '"' && !scanner_is_eof(s) {
 		if scanner_peek(s) == '\n' {
 			s.line += 1
@@ -248,7 +249,7 @@ scanner_string :: proc(s: ^Scanner) {
 	scanner_advance(s)
 
 	val := s.src[s.lex_start + 1:s.pos - 1]
-	scanner_add_token(s, .String, val)
+	scanner_add_full_token(s, {kind = .String, literal = val, line = start_line})
 }
 
 scanner_multiline_comment :: proc(s: ^Scanner) {
@@ -347,6 +348,9 @@ scanner_add_simple_token :: proc(s: ^Scanner, kind: Token_Kind) {
 }
 scanner_add_token_with_literal :: proc(s: ^Scanner, kind: Token_Kind, literal: Token_Literal) {
 	append(&s.tokens, Token{kind = kind, line = s.line, literal = literal})
+}
+scanner_add_full_token :: proc(s: ^Scanner, token: Token) {
+	append(&s.tokens, token)
 }
 scanner_add_token :: proc {
 	scanner_add_simple_token,
