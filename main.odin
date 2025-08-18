@@ -1,5 +1,6 @@
 package main
 
+import "base:runtime"
 import "core:bufio"
 import "core:fmt"
 import "core:io"
@@ -9,6 +10,7 @@ import "core:strconv"
 import "core:strings"
 
 had_error := false
+had_runtime_error := false
 
 main :: proc() {
 	when ODIN_DEBUG {
@@ -52,13 +54,16 @@ run_file :: proc(fpath: string) {
 	if had_error {
 		os.exit(65)
 	}
+	if had_runtime_error {
+		os.exit(70)
+	}
 }
 run_prompt :: proc() {
 	r := io.to_reader(os.stdin.stream)
 	w := io.to_writer(os.stdout.stream)
 
 	sb := strings.builder_make()
-	buf: [4096]byte
+	buf: [1]byte
 	line := ""
 	prompt_loop: for {
 		io.write_string(w, "> ")
@@ -67,7 +72,6 @@ run_prompt :: proc() {
 			if n == 0 {
 				break prompt_loop
 			}
-			fmt.println(n)
 
 			strings.write_bytes(&sb, buf[:n])
 			if buf[n - 1] == '\n' {
@@ -87,12 +91,12 @@ run_code :: proc(code: string) {
 	}
 	tokens := scanner_scan_tokens(&scanner)
 
-	for token in tokens {
-		fmt.println(token)
-	}
 	p := parser_from_tokens(tokens)
 	expr, err := parser_parse(&p)
-	fmt.printfln("Error: %v\nExpression: %#v", err, expr)
+	if err != nil {
+		return
+	}
+	expr_interpret(expr)
 }
 
 Scanner :: struct {
@@ -111,14 +115,22 @@ Token :: struct {
 	kind:    Token_Kind,
 	lexeme:  string,
 	line:    int,
-	literal: Token_Literal,
+	literal: Value,
 }
 
-Token_Literal :: union {
+Value :: union {
+	string,
+	bool,
+	f64,
+	Object,
+}
+
+Object_Key :: union #no_nil {
 	string,
 	bool,
 	f64,
 }
+Object :: map[Object_Key]Value
 
 Token_Kind :: enum u8 {
 	Unknown,
@@ -195,28 +207,23 @@ scanner_scan_token :: proc(s: ^Scanner) {
 
 	switch c {
 	case '(':
-		scanner_add_token(s, .Left_Paren)
+		scanner_add_token(s, .Left_Paren, "(")
 	case ')':
-		scanner_add_token(s, .Right_Paren)
+		scanner_add_token(s, .Right_Paren, ")")
 	case '{':
-		scanner_add_token(s, .Left_Brace)
+		scanner_add_token(s, .Left_Brace, "{")
 	case '}':
-		scanner_add_token(s, .Right_Brace)
+		scanner_add_token(s, .Right_Brace, "}")
 	case ',':
-		scanner_add_token(s, .Comma)
+		scanner_add_token(s, .Comma, ",")
 	case '.':
-		next := scanner_peek(s)
-		if next >= '0' && next <= '9' {
-			report(s.line, "Leading dot before number")
-			return
-		}
-		scanner_add_token(s, .Dot)
+		scanner_add_token(s, .Dot, ".")
 	case '-':
 		scanner_add_token(s, .Minus, "-")
 	case '+':
 		scanner_add_token(s, .Plus, "+")
 	case ';':
-		scanner_add_token(s, .Semicolon)
+		scanner_add_token(s, .Semicolon, ";")
 	case '*':
 		scanner_add_token(s, .Star, "*")
 	case '/':
@@ -366,7 +373,7 @@ scanner_identifier :: proc(s: ^Scanner) {
 scanner_add_simple_token :: proc(s: ^Scanner, kind: Token_Kind) {
 	append(&s.tokens, Token{kind = kind, line = s.line})
 }
-scanner_add_token_with_literal :: proc(s: ^Scanner, kind: Token_Kind, literal: Token_Literal) {
+scanner_add_token_with_literal :: proc(s: ^Scanner, kind: Token_Kind, literal: Value) {
 	append(&s.tokens, Token{kind = kind, line = s.line, literal = literal})
 }
 scanner_add_full_token :: proc(s: ^Scanner, token: Token) {
@@ -398,7 +405,11 @@ scanner_match :: proc(s: ^Scanner, expected: byte) -> bool {
 }
 
 report :: proc(line: int, message: ..string) {
-	fmt.printfln("[line %d] Error: %s", line, message)
+	fmt.printf("[line %d] Error:", line)
+	for msg in message {
+		fmt.print(msg)
+	}
+	fmt.print("\n")
 	had_error = true
 }
 
@@ -406,7 +417,7 @@ error :: proc(token: ^Token, msg: string) -> Parse_Error_Unexpected_Token {
 	if token.kind == .EOF {
 		report(token.line, " at end", msg)
 	} else {
-		report(token.line, " at '", token.lexeme, "'", msg)
+		report(token.line, " at '", token.lexeme, "' ", msg)
 	}
 	return {token = token, message = msg}
 }
@@ -429,7 +440,7 @@ Expr_Grouping :: struct {
 }
 
 Expr_Literal :: struct {
-	value: Token_Literal,
+	value: Value,
 }
 
 Expr_Unary :: struct {
@@ -640,4 +651,142 @@ parser_sync :: proc(p: ^Parser) {
 
 		parser_advance(p)
 	}
+}
+
+expr_to_value :: proc(expr: Expr, allocator := context.allocator) -> (v: Value, err: Parse_Error) {
+	switch v in expr {
+	case (^Expr_Grouping):
+		return expr_to_value(v.expression, allocator)
+	case (^Expr_Literal):
+		return v.value, nil
+	case (^Expr_Unary):
+		right := expr_to_value(v.right, allocator) or_return
+
+		#partial switch v.operator.kind {
+		case .Minus:
+			num := right.(f64)
+			return -num, nil
+		case .Bang:
+			return !value_is_truthy(right), nil
+		}
+		return nil, nil // unreachebale
+	case (^Expr_Binary):
+		left := expr_to_value(v.left, allocator) or_return
+		right := expr_to_value(v.right, allocator) or_return
+		#partial switch v.operator.kind {
+		case .Minus:
+			operands_are_numbers(v.operator, left, right) or_return
+			return left.(f64) - right.(f64), nil
+		case .Slash:
+			operands_are_numbers(v.operator, left, right) or_return
+			return left.(f64) / right.(f64), nil
+		case .Star:
+			operands_are_numbers(v.operator, left, right) or_return
+			return left.(f64) * right.(f64), nil
+		case .Plus:
+			l_num, l_num_ok := left.(f64)
+			r_num, r_num_ok := right.(f64)
+			if l_num_ok && r_num_ok {
+				return l_num + r_num, nil
+			}
+			l_str, l_str_ok := left.(string)
+			r_str, r_str_ok := right.(string)
+			if l_str_ok && r_str_ok {
+				res := strings.concatenate({l_str, r_str}, allocator)
+				return res, nil
+			}
+			return nil, Parse_Error_Unexpected_Token {
+				token = v.operator,
+				message = "Operands must both be numbers or strings",
+			}
+		case .Greater:
+			operands_are_numbers(v.operator, left, right) or_return
+			return left.(f64) > right.(f64), nil
+		case .Greater_Equal:
+			operands_are_numbers(v.operator, left, right) or_return
+			return left.(f64) >= right.(f64), nil
+		case .Less:
+			operands_are_numbers(v.operator, left, right) or_return
+			return left.(f64) < right.(f64), nil
+		case .Less_Equal:
+			operands_are_numbers(v.operator, left, right) or_return
+			return left.(f64) <= right.(f64), nil
+		case .Bang_Equal:
+			return !values_are_equal(left, right), nil
+		case .Equal_Equal:
+			return values_are_equal(left, right), nil
+		}
+	}
+	return nil, nil
+}
+
+//`false` and `nil` are falsy, all the other values are truthy
+value_is_truthy :: proc(v: Value) -> bool {
+	if v == nil do return false
+
+	boolean, ok := v.(bool)
+	if ok do return boolean
+
+	return true
+}
+
+values_are_equal :: proc(left, right: Value) -> bool {
+	switch l in left {
+	case bool:
+		r, ok := right.(bool)
+		if !ok do return false
+		return l == r
+	case string:
+		r, ok := right.(string)
+		if !ok do return false
+		return l == r
+	case f64:
+		r, ok := right.(f64)
+		if !ok do return false
+		return l == r
+	case Object:
+		r, ok := right.(Object)
+		if !ok do return false
+		return (transmute(runtime.Raw_Map)l).data == (transmute(runtime.Raw_Map)r).data
+	case nil:
+		if right == nil do return true
+		return false
+	}
+	return false
+}
+
+operand_is_number :: proc(tkn: ^Token, operand: Value) -> Parse_Error {
+	_, is_num := operand.(f64)
+	if is_num {
+		return nil
+	} else {
+		return Parse_Error_Unexpected_Token{token = tkn, message = "Operand must be a number."}
+	}
+}
+operands_are_numbers :: proc(tkn: ^Token, left, right: Value) -> Parse_Error {
+	_, left_num := left.(f64)
+	_, right_num := right.(f64)
+	if left_num && right_num {
+		return nil
+	} else {
+		return Parse_Error_Unexpected_Token{token = tkn, message = "Operands must be numbers."}
+	}
+}
+
+expr_interpret :: proc(expr: Expr) {
+	val, err := expr_to_value(expr)
+	if err != nil {
+		runtime_error(err)
+	} else {
+		fmt.printfln("%v", val)
+	}
+}
+
+runtime_error :: proc(err: Parse_Error) {
+	if err == nil do return
+	switch v in err {
+	case Parse_Error_Unexpected_Token:
+		fmt.eprintfln("[line %d]: %s", v.token.line, v.message)
+	}
+	had_runtime_error = true
 }
