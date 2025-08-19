@@ -96,7 +96,7 @@ run_code :: proc(code: string) {
 	if err != nil {
 		return
 	}
-	expr_interpret(expr)
+	stmt_interpret(expr[:])
 }
 
 Scanner :: struct {
@@ -462,8 +462,13 @@ Parse_Error_Unexpected_Token :: struct {
 	message: string,
 }
 
-parser_parse :: proc(p: ^Parser) -> (Expr, Parse_Error) {
-	return parser_expression(p)
+parser_parse :: proc(p: ^Parser) -> (stmts: [dynamic]Stmt, err: Parse_Error) {
+	stmts = make([dynamic]Stmt)
+	for !parser_is_eof(p) {
+		stmt := parser_stmt(p) or_return
+		append(&stmts, stmt)
+	}
+	return stmts, nil
 }
 
 parser_from_tokens :: proc(tokens: []Token) -> Parser {
@@ -773,12 +778,13 @@ operands_are_numbers :: proc(tkn: ^Token, left, right: Value) -> Parse_Error {
 	}
 }
 
-expr_interpret :: proc(expr: Expr) {
-	val, err := expr_to_value(expr)
-	if err != nil {
-		runtime_error(err)
-	} else {
-		fmt.printfln("%v", val)
+stmt_interpret :: proc(stmts: []Stmt) {
+	for s in stmts {
+		err := stmt_execute(s)
+		if err != nil {
+			runtime_error(err)
+			break
+		}
 	}
 }
 
@@ -789,4 +795,63 @@ runtime_error :: proc(err: Parse_Error) {
 		fmt.eprintfln("[line %d]: %s", v.token.line, v.message)
 	}
 	had_runtime_error = true
+}
+
+Stmt :: union {
+	^Stmt_Print,
+	^Stmt_Expr,
+}
+
+Stmt_Print :: struct {
+	expr: Expr,
+}
+
+Stmt_Expr :: struct {
+	expr: Expr,
+}
+
+parser_stmt :: proc(p: ^Parser, allocator := context.allocator) -> (Stmt, Parse_Error) {
+	if parser_match(p, {.Print}) {
+		return parser_stmt_print(p, allocator)
+	}
+	return parser_stmt_expression(p, allocator)
+}
+
+parser_stmt_print :: proc(
+	p: ^Parser,
+	allocator := context.allocator,
+) -> (
+	s: Stmt,
+	err: Parse_Error,
+) {
+	val := parser_expression(p) or_return
+	parser_consume(p, .Semicolon, "Expect ';' after value.") or_return
+	stmt := new(Stmt_Print, allocator)
+	stmt.expr = val
+	return stmt, nil
+}
+
+parser_stmt_expression :: proc(
+	p: ^Parser,
+	allocator := context.allocator,
+) -> (
+	s: Stmt,
+	err: Parse_Error,
+) {
+	val := parser_expression(p) or_return
+	parser_consume(p, .Semicolon, "Expect ';' after value.") or_return
+	stmt := new(Stmt_Expr, allocator)
+	stmt.expr = val
+	return stmt, nil
+}
+
+stmt_execute :: proc(stmt: Stmt) -> Parse_Error {
+	#partial switch v in stmt {
+	case (^Stmt_Expr):
+		expr_to_value(v.expr) or_return
+	case (^Stmt_Print):
+		val := expr_to_value(v.expr) or_return
+		fmt.printfln("%#v", val)
+	}
+	return nil
 }
