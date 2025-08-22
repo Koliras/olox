@@ -96,7 +96,8 @@ run_code :: proc(code: string) {
 	if err != nil {
 		return
 	}
-	stmt_interpret(expr[:])
+	env := env_init()
+	stmt_interpret(expr[:], &env)
 }
 
 Scanner :: struct {
@@ -367,7 +368,11 @@ scanner_identifier :: proc(s: ^Scanner) {
 	case "while":
 		type = .While
 	}
-	scanner_add_token(s, type)
+	if type == .Identifier {
+		scanner_add_token_with_lexeme(s, type, text)
+	} else {
+		scanner_add_token(s, type)
+	}
 }
 
 scanner_add_simple_token :: proc(s: ^Scanner, kind: Token_Kind) {
@@ -415,7 +420,7 @@ report :: proc(line: int, message: ..string) {
 
 error :: proc(token: ^Token, msg: string) -> Parse_Error_Unexpected_Token {
 	if token.kind == .EOF {
-		report(token.line, " at end", msg)
+		report(token.line, " at the end. ", msg)
 	} else {
 		report(token.line, " at '", token.lexeme, "' ", msg)
 	}
@@ -427,6 +432,7 @@ Expr :: union {
 	^Expr_Unary,
 	^Expr_Binary,
 	^Expr_Grouping,
+	^Expr_Variable,
 }
 
 Expr_Binary :: struct {
@@ -448,24 +454,34 @@ Expr_Unary :: struct {
 	right:    Expr,
 }
 
+Expr_Variable :: struct {
+	name: ^Token,
+}
+
 Parser :: struct {
 	current: int,
 	tokens:  []Token,
 }
 
-Parse_Error :: union {
+Error :: union {
 	Parse_Error_Unexpected_Token,
+	Error_Variable_Undefined,
 }
+
+Error_Variable_Undefined :: struct {
+	name: ^Token,
+}
+
 
 Parse_Error_Unexpected_Token :: struct {
 	token:   ^Token,
 	message: string,
 }
 
-parser_parse :: proc(p: ^Parser) -> (stmts: [dynamic]Stmt, err: Parse_Error) {
+parser_parse :: proc(p: ^Parser) -> (stmts: [dynamic]Stmt, err: Error) {
 	stmts = make([dynamic]Stmt)
 	for !parser_is_eof(p) {
-		stmt := parser_stmt(p) or_return
+		stmt := parser_decl(p)
 		append(&stmts, stmt)
 	}
 	return stmts, nil
@@ -475,17 +491,11 @@ parser_from_tokens :: proc(tokens: []Token) -> Parser {
 	return Parser{tokens = tokens}
 }
 
-parser_expression :: proc(p: ^Parser, allocator := context.allocator) -> (Expr, Parse_Error) {
+parser_expression :: proc(p: ^Parser, allocator := context.allocator) -> (Expr, Error) {
 	return parser_equality(p, allocator)
 }
 
-parser_equality :: proc(
-	p: ^Parser,
-	allocator := context.allocator,
-) -> (
-	e: Expr,
-	err: Parse_Error,
-) {
+parser_equality :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Error) {
 	expr := parser_comparison(p, allocator) or_return
 
 	for parser_match(p, {.Equal_Equal, .Equal_Equal}) {
@@ -500,13 +510,7 @@ parser_equality :: proc(
 	return expr, nil
 }
 
-parser_comparison :: proc(
-	p: ^Parser,
-	allocator := context.allocator,
-) -> (
-	e: Expr,
-	err: Parse_Error,
-) {
+parser_comparison :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Error) {
 	expr := parser_term(p, allocator) or_return
 
 	for parser_match(p, {.Greater, .Greater_Equal, .Less, .Less_Equal}) {
@@ -557,7 +561,7 @@ parser_advance :: proc(p: ^Parser) -> ^Token {
 	return parser_prev(p)
 }
 
-parser_term :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Parse_Error) {
+parser_term :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Error) {
 	expr := parser_factor(p, allocator) or_return
 
 	for parser_match(p, {.Minus, .Plus}) {
@@ -572,7 +576,7 @@ parser_term :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err
 	return expr, nil
 }
 
-parser_factor :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Parse_Error) {
+parser_factor :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Error) {
 	expr := parser_unary(p, allocator) or_return
 
 	for parser_match(p, {.Slash, .Star}) {
@@ -587,7 +591,7 @@ parser_factor :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, e
 	return expr, nil
 }
 
-parser_unary :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Parse_Error) {
+parser_unary :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Error) {
 	if parser_match(p, {.Bang, .Minus}) {
 		operator := parser_prev(p)
 		right := parser_unary(p) or_return
@@ -599,7 +603,7 @@ parser_unary :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, er
 	return parser_primary(p, allocator)
 }
 
-parser_primary :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Parse_Error) {
+parser_primary :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Error) {
 	if parser_match(p, {.False}) {
 		expr := new(Expr_Literal, allocator)
 		expr.value = false
@@ -622,6 +626,12 @@ parser_primary :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, 
 		return expr, nil
 	}
 
+	if parser_match(p, {.Identifier}) {
+		expr := new(Expr_Variable, allocator)
+		expr.name = parser_prev(p)
+		return expr, nil
+	}
+
 	if parser_match(p, {.Left_Paren}) {
 		expr := parser_expression(p, allocator) or_return
 		tkn, parse_err := parser_consume(p, .Right_Paren, "Expect ')' after expression.")
@@ -636,7 +646,7 @@ parser_primary :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, 
 	return {}, error(parser_peek(p), "Expect expression.")
 }
 
-parser_consume :: proc(p: ^Parser, kind: Token_Kind, msg: string) -> (^Token, Parse_Error) {
+parser_consume :: proc(p: ^Parser, kind: Token_Kind, msg: string) -> (^Token, Error) {
 	if parser_check(p, kind) do return parser_advance(p), nil
 
 	token := parser_peek(p)
@@ -658,14 +668,21 @@ parser_sync :: proc(p: ^Parser) {
 	}
 }
 
-expr_to_value :: proc(expr: Expr, allocator := context.allocator) -> (v: Value, err: Parse_Error) {
+expr_to_value :: proc(
+	expr: Expr,
+	env: ^Env,
+	allocator := context.allocator,
+) -> (
+	v: Value,
+	err: Error,
+) {
 	switch v in expr {
 	case (^Expr_Grouping):
-		return expr_to_value(v.expression, allocator)
+		return expr_to_value(v.expression, env, allocator)
 	case (^Expr_Literal):
 		return v.value, nil
 	case (^Expr_Unary):
-		right := expr_to_value(v.right, allocator) or_return
+		right := expr_to_value(v.right, env, allocator) or_return
 
 		#partial switch v.operator.kind {
 		case .Minus:
@@ -676,8 +693,8 @@ expr_to_value :: proc(expr: Expr, allocator := context.allocator) -> (v: Value, 
 		}
 		return nil, nil // unreachebale
 	case (^Expr_Binary):
-		left := expr_to_value(v.left, allocator) or_return
-		right := expr_to_value(v.right, allocator) or_return
+		left := expr_to_value(v.left, env, allocator) or_return
+		right := expr_to_value(v.right, env, allocator) or_return
 		#partial switch v.operator.kind {
 		case .Minus:
 			operands_are_numbers(v.operator, left, right) or_return
@@ -721,6 +738,12 @@ expr_to_value :: proc(expr: Expr, allocator := context.allocator) -> (v: Value, 
 		case .Equal_Equal:
 			return values_are_equal(left, right), nil
 		}
+	case (^Expr_Variable):
+		val, ok := env_get(env, v.name.lexeme)
+		if !ok {
+			return nil, Error_Variable_Undefined{name = v.name}
+		}
+		return val, nil
 	}
 	return nil, nil
 }
@@ -760,7 +783,7 @@ values_are_equal :: proc(left, right: Value) -> bool {
 	return false
 }
 
-operand_is_number :: proc(tkn: ^Token, operand: Value) -> Parse_Error {
+operand_is_number :: proc(tkn: ^Token, operand: Value) -> Error {
 	_, is_num := operand.(f64)
 	if is_num {
 		return nil
@@ -768,7 +791,7 @@ operand_is_number :: proc(tkn: ^Token, operand: Value) -> Parse_Error {
 		return Parse_Error_Unexpected_Token{token = tkn, message = "Operand must be a number."}
 	}
 }
-operands_are_numbers :: proc(tkn: ^Token, left, right: Value) -> Parse_Error {
+operands_are_numbers :: proc(tkn: ^Token, left, right: Value) -> Error {
 	_, left_num := left.(f64)
 	_, right_num := right.(f64)
 	if left_num && right_num {
@@ -778,9 +801,9 @@ operands_are_numbers :: proc(tkn: ^Token, left, right: Value) -> Parse_Error {
 	}
 }
 
-stmt_interpret :: proc(stmts: []Stmt) {
+stmt_interpret :: proc(stmts: []Stmt, env: ^Env) {
 	for s in stmts {
-		err := stmt_execute(s)
+		err := stmt_execute(env, s)
 		if err != nil {
 			runtime_error(err)
 			break
@@ -788,11 +811,13 @@ stmt_interpret :: proc(stmts: []Stmt) {
 	}
 }
 
-runtime_error :: proc(err: Parse_Error) {
+runtime_error :: proc(err: Error) {
 	if err == nil do return
 	switch v in err {
 	case Parse_Error_Unexpected_Token:
 		fmt.eprintfln("[line %d]: %s", v.token.line, v.message)
+	case Error_Variable_Undefined:
+		fmt.eprintfln("Undefined variable '%s' at line %d.", v.name.lexeme, v.name.line)
 	}
 	had_runtime_error = true
 }
@@ -800,6 +825,7 @@ runtime_error :: proc(err: Parse_Error) {
 Stmt :: union {
 	^Stmt_Print,
 	^Stmt_Expr,
+	^Stmt_Var,
 }
 
 Stmt_Print :: struct {
@@ -810,20 +836,55 @@ Stmt_Expr :: struct {
 	expr: Expr,
 }
 
-parser_stmt :: proc(p: ^Parser, allocator := context.allocator) -> (Stmt, Parse_Error) {
+Stmt_Var :: struct {
+	name:        ^Token,
+	initializer: Expr,
+}
+
+parser_stmt :: proc(p: ^Parser, allocator := context.allocator) -> (Stmt, Error) {
 	if parser_match(p, {.Print}) {
 		return parser_stmt_print(p, allocator)
 	}
 	return parser_stmt_expression(p, allocator)
 }
 
-parser_stmt_print :: proc(
+parser_decl :: proc(p: ^Parser, allocator := context.allocator) -> Stmt {
+	if parser_match(p, {.Var}) {
+		var, err := var_declaration(p, allocator)
+		if err != nil {
+			parser_sync(p)
+			return nil
+		}
+		return var
+	}
+	stmt, err := parser_stmt(p, allocator)
+	if err != nil {
+		parser_sync(p)
+		return nil
+	}
+	return stmt
+}
+
+var_declaration :: proc(
 	p: ^Parser,
 	allocator := context.allocator,
 ) -> (
-	s: Stmt,
-	err: Parse_Error,
+	stmt: ^Stmt_Var,
+	err: Error,
 ) {
+	name := parser_consume(p, .Identifier, "Expect variable name.") or_return
+	init: Expr
+	if parser_match(p, {.Equal}) {
+		init = parser_expression(p) or_return
+	}
+	parser_consume(p, .Semicolon, "Expect ';' after variable declaration.") or_return
+	decl := new(Stmt_Var, allocator)
+	decl.name = name
+	decl.initializer = init
+	return decl, nil
+}
+
+parser_stmt_print :: proc(p: ^Parser, allocator := context.allocator) -> (s: Stmt, err: Error) {
 	val := parser_expression(p) or_return
 	parser_consume(p, .Semicolon, "Expect ';' after value.") or_return
 	stmt := new(Stmt_Print, allocator)
@@ -836,7 +897,7 @@ parser_stmt_expression :: proc(
 	allocator := context.allocator,
 ) -> (
 	s: Stmt,
-	err: Parse_Error,
+	err: Error,
 ) {
 	val := parser_expression(p) or_return
 	parser_consume(p, .Semicolon, "Expect ';' after value.") or_return
@@ -845,13 +906,35 @@ parser_stmt_expression :: proc(
 	return stmt, nil
 }
 
-stmt_execute :: proc(stmt: Stmt) -> Parse_Error {
-	#partial switch v in stmt {
+stmt_execute :: proc(env: ^Env, stmt: Stmt) -> Error {
+	switch v in stmt {
 	case (^Stmt_Expr):
-		expr_to_value(v.expr) or_return
+		expr_to_value(v.expr, env) or_return
 	case (^Stmt_Print):
-		val := expr_to_value(v.expr) or_return
+		val := expr_to_value(v.expr, env) or_return
 		fmt.printfln("%#v", val)
+	case (^Stmt_Var):
+		val: Value
+		if v.initializer != nil {
+			val = expr_to_value(v.initializer, env) or_return
+		}
+		env_define(env, v.name.lexeme, val)
 	}
 	return nil
+}
+
+Env :: struct {
+	values: map[string]Value,
+}
+
+env_init :: proc() -> Env {
+	return {values = make(map[string]Value)}
+}
+
+env_define :: #force_inline proc(env: ^Env, name: string, val: Value) {
+	env.values[name] = val
+}
+
+env_get :: #force_inline proc(env: ^Env, name: string) -> (val: Value, ok: bool) {
+	return env.values[name]
 }
