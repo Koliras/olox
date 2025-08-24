@@ -433,6 +433,7 @@ Expr :: union {
 	^Expr_Binary,
 	^Expr_Grouping,
 	^Expr_Variable,
+	^Expr_Assignment,
 }
 
 Expr_Binary :: struct {
@@ -456,6 +457,11 @@ Expr_Unary :: struct {
 
 Expr_Variable :: struct {
 	name: ^Token,
+}
+
+Expr_Assignment :: struct {
+	name:  ^Token,
+	value: Expr,
 }
 
 Parser :: struct {
@@ -492,13 +498,35 @@ parser_from_tokens :: proc(tokens: []Token) -> Parser {
 }
 
 parser_expression :: proc(p: ^Parser, allocator := context.allocator) -> (Expr, Error) {
-	return parser_equality(p, allocator)
+	return parser_assignment(p, allocator)
+}
+
+parser_assignment :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Error) {
+	expr := parser_equality(p, allocator) or_return
+
+	if parser_match(p, {.Equal}) {
+		equals := parser_prev(p)
+		val := parser_assignment(p, allocator) or_return
+
+		var, is_var := expr.(^Expr_Variable)
+		if is_var {
+			name := var.name
+			assign := new(Expr_Assignment, allocator)
+			assign.name = name
+			assign.value = val
+			return assign, nil
+		}
+
+		return nil, error(equals, "Invalid assignment target.")
+	}
+
+	return expr, nil
 }
 
 parser_equality :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Error) {
 	expr := parser_comparison(p, allocator) or_return
 
-	for parser_match(p, {.Equal_Equal, .Equal_Equal}) {
+	for parser_match(p, {.Bang_Equal, .Equal_Equal}) {
 		operator := parser_prev(p)
 		right := parser_comparison(p, allocator) or_return
 		bin := new(Expr_Binary, allocator)
@@ -744,6 +772,10 @@ expr_to_value :: proc(
 			return nil, Error_Variable_Undefined{name = v.name}
 		}
 		return val, nil
+	case (^Expr_Assignment):
+		val := expr_to_value(v.value, env) or_return
+		env_assign(env, v.name, val) or_return
+		return val, nil
 	}
 	return nil, nil
 }
@@ -826,6 +858,7 @@ Stmt :: union {
 	^Stmt_Print,
 	^Stmt_Expr,
 	^Stmt_Var,
+	^Stmt_Block,
 }
 
 Stmt_Print :: struct {
@@ -841,9 +874,30 @@ Stmt_Var :: struct {
 	initializer: Expr,
 }
 
+Stmt_Block :: struct {
+	statements: []Stmt,
+}
+
+env_execute_block :: proc(outer_env: ^Env, stmts: []Stmt, allocator := context.allocator) {
+	env := Env {
+		enclosing = outer_env,
+		values    = make(map[string]Value, allocator),
+	}
+
+	for stmt in stmts {
+		stmt_execute(&env, stmt, allocator)
+	}
+	defer {
+		delete(env.values)
+	}
+}
+
 parser_stmt :: proc(p: ^Parser, allocator := context.allocator) -> (Stmt, Error) {
 	if parser_match(p, {.Print}) {
 		return parser_stmt_print(p, allocator)
+	}
+	if parser_match(p, {.Left_Brace}) {
+		return parser_stmt_block(p, allocator)
 	}
 	return parser_stmt_expression(p, allocator)
 }
@@ -906,7 +960,28 @@ parser_stmt_expression :: proc(
 	return stmt, nil
 }
 
-stmt_execute :: proc(env: ^Env, stmt: Stmt) -> Error {
+parser_stmt_block :: proc(p: ^Parser, allocator := context.allocator) -> (stmt: Stmt, err: Error) {
+	block_stmts := parser_block(p, allocator) or_return
+	block := new(Stmt_Block, allocator)
+	block.statements = block_stmts
+	return block, nil
+}
+
+parser_block :: proc(p: ^Parser, allocator := context.allocator) -> ([]Stmt, Error) {
+	stmts := make([dynamic]Stmt)
+
+	for !parser_check(p, .Right_Brace) && !parser_is_eof(p) {
+		append(&stmts, parser_decl(p, allocator))
+	}
+
+	if _, err := parser_consume(p, .Right_Brace, "Expect '}' after block"); err != nil {
+		delete(stmts)
+		return {}, err
+	}
+	return stmts[:], nil
+}
+
+stmt_execute :: proc(env: ^Env, stmt: Stmt, allocator := context.allocator) -> Error {
 	switch v in stmt {
 	case (^Stmt_Expr):
 		expr_to_value(v.expr, env) or_return
@@ -919,22 +994,43 @@ stmt_execute :: proc(env: ^Env, stmt: Stmt) -> Error {
 			val = expr_to_value(v.initializer, env) or_return
 		}
 		env_define(env, v.name.lexeme, val)
+	case (^Stmt_Block):
+		env_execute_block(env, v.statements, allocator)
 	}
 	return nil
 }
 
 Env :: struct {
-	values: map[string]Value,
+	enclosing: ^Env,
+	values:    map[string]Value,
 }
 
-env_init :: proc() -> Env {
-	return {values = make(map[string]Value)}
+env_init :: proc(enclosing: ^Env = nil) -> Env {
+	return {values = make(map[string]Value), enclosing = enclosing}
 }
 
 env_define :: #force_inline proc(env: ^Env, name: string, val: Value) {
 	env.values[name] = val
 }
 
-env_get :: #force_inline proc(env: ^Env, name: string) -> (val: Value, ok: bool) {
-	return env.values[name]
+env_get :: proc(env: ^Env, name: string) -> (val: Value, ok: bool) {
+	val, ok = env.values[name]
+	if ok {
+		return val, ok
+	}
+	if env.enclosing == nil {
+		return nil, false
+	}
+	return env_get(env.enclosing, name)
+}
+
+env_assign :: proc(env: ^Env, name: ^Token, val: Value) -> Error {
+	if _, has_var := env.values[name.lexeme]; has_var {
+		env.values[name.lexeme] = val
+		return nil
+	}
+	if env.enclosing != nil {
+		return env_assign(env.enclosing, name, val)
+	}
+	return Error_Variable_Undefined{name = name}
 }
