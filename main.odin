@@ -434,6 +434,13 @@ Expr :: union {
 	^Expr_Grouping,
 	^Expr_Variable,
 	^Expr_Assignment,
+	^Expr_Logical,
+}
+
+Expr_Logical :: struct {
+	operator: ^Token,
+	left:     Expr,
+	right:    Expr,
 }
 
 Expr_Binary :: struct {
@@ -502,7 +509,7 @@ parser_expression :: proc(p: ^Parser, allocator := context.allocator) -> (Expr, 
 }
 
 parser_assignment :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Error) {
-	expr := parser_equality(p, allocator) or_return
+	expr := parser_or(p, allocator) or_return
 
 	if parser_match(p, {.Equal}) {
 		equals := parser_prev(p)
@@ -518,6 +525,38 @@ parser_assignment :: proc(p: ^Parser, allocator := context.allocator) -> (e: Exp
 		}
 
 		return nil, error(equals, "Invalid assignment target.")
+	}
+
+	return expr, nil
+}
+
+parser_or :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Error) {
+	expr := parser_and(p, allocator) or_return
+
+	for parser_match(p, {.Or}) {
+		operator := parser_prev(p)
+		right := parser_and(p, allocator) or_return
+		new_expr := new(Expr_Logical, allocator)
+		new_expr.left = expr
+		new_expr.right = right
+		new_expr.operator = operator
+		expr = new_expr
+	}
+
+	return expr, nil
+}
+
+parser_and :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Error) {
+	expr := parser_equality(p, allocator) or_return
+
+	for parser_match(p, {.And}) {
+		operator := parser_prev(p)
+		right := parser_equality(p, allocator) or_return
+		new_expr := new(Expr_Logical, allocator)
+		new_expr.left = expr
+		new_expr.right = right
+		new_expr.operator = operator
+		expr = new_expr
 	}
 
 	return expr, nil
@@ -776,6 +815,17 @@ expr_to_value :: proc(
 		val := expr_to_value(v.value, env) or_return
 		env_assign(env, v.name, val) or_return
 		return val, nil
+	case (^Expr_Logical):
+		left := expr_to_value(v.left, env) or_return
+
+		is_truthy := value_is_truthy(left)
+		if v.operator.kind == .Or {
+			if is_truthy do return left, nil
+		} else {
+			if !is_truthy do return left, nil
+		}
+
+		return expr_to_value(v.right, env)
 	}
 	return nil, nil
 }
@@ -835,7 +885,7 @@ operands_are_numbers :: proc(tkn: ^Token, left, right: Value) -> Error {
 
 stmt_interpret :: proc(stmts: []Stmt, env: ^Env) {
 	for s in stmts {
-		err := stmt_execute(env, s)
+		err := stmt_execute(s, env)
 		if err != nil {
 			runtime_error(err)
 			break
@@ -859,6 +909,7 @@ Stmt :: union {
 	^Stmt_Expr,
 	^Stmt_Var,
 	^Stmt_Block,
+	^Stmt_If,
 }
 
 Stmt_Print :: struct {
@@ -878,6 +929,12 @@ Stmt_Block :: struct {
 	statements: []Stmt,
 }
 
+Stmt_If :: struct {
+	condition:   Expr,
+	branch_then: Stmt,
+	branch_else: Stmt,
+}
+
 env_execute_block :: proc(outer_env: ^Env, stmts: []Stmt, allocator := context.allocator) {
 	env := Env {
 		enclosing = outer_env,
@@ -885,7 +942,7 @@ env_execute_block :: proc(outer_env: ^Env, stmts: []Stmt, allocator := context.a
 	}
 
 	for stmt in stmts {
-		stmt_execute(&env, stmt, allocator)
+		stmt_execute(stmt, &env, allocator)
 	}
 	defer {
 		delete(env.values)
@@ -893,6 +950,9 @@ env_execute_block :: proc(outer_env: ^Env, stmts: []Stmt, allocator := context.a
 }
 
 parser_stmt :: proc(p: ^Parser, allocator := context.allocator) -> (Stmt, Error) {
+	if parser_match(p, {.If}) {
+		return parser_stmt_if(p, allocator)
+	}
 	if parser_match(p, {.Print}) {
 		return parser_stmt_print(p, allocator)
 	}
@@ -900,6 +960,23 @@ parser_stmt :: proc(p: ^Parser, allocator := context.allocator) -> (Stmt, Error)
 		return parser_stmt_block(p, allocator)
 	}
 	return parser_stmt_expression(p, allocator)
+}
+
+parser_stmt_if :: proc(p: ^Parser, allocator := context.allocator) -> (stmt: Stmt, err: Error) {
+	parser_consume(p, .Left_Paren, "Expect '(' after 'if'.") or_return
+	cond := parser_expression(p, allocator) or_return
+	parser_consume(p, .Right_Paren, "Expect ')' after if condition.") or_return
+
+	branch_then := parser_stmt(p, allocator) or_return
+	branch_else: Stmt
+	if parser_match(p, {.Else}) {
+		branch_else = parser_stmt(p, allocator) or_return
+	}
+	if_ := new(Stmt_If, allocator)
+	if_.condition = cond
+	if_.branch_then = branch_then
+	if_.branch_else = branch_else
+	return if_, nil
 }
 
 parser_decl :: proc(p: ^Parser, allocator := context.allocator) -> Stmt {
@@ -981,7 +1058,7 @@ parser_block :: proc(p: ^Parser, allocator := context.allocator) -> ([]Stmt, Err
 	return stmts[:], nil
 }
 
-stmt_execute :: proc(env: ^Env, stmt: Stmt, allocator := context.allocator) -> Error {
+stmt_execute :: proc(stmt: Stmt, env: ^Env, allocator := context.allocator) -> Error {
 	switch v in stmt {
 	case (^Stmt_Expr):
 		expr_to_value(v.expr, env) or_return
@@ -996,6 +1073,13 @@ stmt_execute :: proc(env: ^Env, stmt: Stmt, allocator := context.allocator) -> E
 		env_define(env, v.name.lexeme, val)
 	case (^Stmt_Block):
 		env_execute_block(env, v.statements, allocator)
+	case (^Stmt_If):
+		val := expr_to_value(v.condition, env) or_return
+		if value_is_truthy(val) {
+			stmt_execute(v.branch_then, env) or_return
+		} else if v.branch_else != nil {
+			stmt_execute(v.branch_else, env) or_return
+		}
 	}
 	return nil
 }

@@ -1,6 +1,13 @@
+print nil or "string";
+print true and nil;
 var a = 1;
 {
   var a = a + 2;
-  print a;
+  if (a < 2) {
+      print a;
+  } else {
+      print a + 6;
+  }
+  if (a>2) print "foo";
 }
 print a;
