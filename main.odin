@@ -956,6 +956,9 @@ env_execute_block :: proc(outer_env: ^Env, stmts: []Stmt, allocator := context.a
 }
 
 parser_stmt :: proc(p: ^Parser, allocator := context.allocator) -> (Stmt, Error) {
+	if parser_match(p, {.For}) {
+		return parser_stmt_for(p, allocator)
+	}
 	if parser_match(p, {.If}) {
 		return parser_stmt_if(p, allocator)
 	}
@@ -969,6 +972,64 @@ parser_stmt :: proc(p: ^Parser, allocator := context.allocator) -> (Stmt, Error)
 		return parser_stmt_block(p, allocator)
 	}
 	return parser_stmt_expression(p, allocator)
+}
+
+parser_stmt_for :: proc(p: ^Parser, allocator := context.allocator) -> (stmt: Stmt, err: Error) {
+	parser_consume(p, .Left_Paren, "Expect '(' after 'for'.") or_return
+	initializer: Stmt
+	if parser_match(p, {.Semicolon}) {
+		initializer = nil
+	} else if parser_match(p, {.Var}) {
+		initializer = parser_stmt_var_decl(p, allocator) or_return
+	} else {
+		initializer = parser_stmt_expression(p, allocator) or_return
+	}
+
+	condition: Expr
+	if !parser_check(p, .Semicolon) {
+		condition = parser_expression(p, allocator) or_return
+	}
+	parser_consume(p, .Semicolon, "Expect ';' after loop condition.") or_return
+
+	increment: Expr
+	if !parser_check(p, .Right_Paren) {
+		increment = parser_expression(p, allocator) or_return
+	}
+	parser_consume(p, .Right_Paren, "Expect ')' after for clause.") or_return
+
+	body := parser_stmt(p, allocator) or_return
+	if increment != nil {
+		expr := new(Stmt_Expr, allocator)
+		expr.expr = increment
+		new_body := new(Stmt_Block, allocator)
+		statements := make([]Stmt, 2, allocator)
+		statements[0] = body
+		statements[1] = expr
+		new_body.statements = statements
+		body = new_body
+	}
+
+	if condition == nil {
+		new_condition := new(Expr_Literal, allocator)
+		new_condition.value = true
+		condition = new_condition
+	}
+
+	while := new(Stmt_While, allocator)
+	while.condition = condition
+	while.body = body
+	body = while
+
+	if initializer != nil {
+		new_body := new(Stmt_Block, allocator)
+		statements := make([]Stmt, 2, allocator)
+		statements[0] = initializer
+		statements[1] = body
+		new_body.statements = statements
+		body = new_body
+	}
+
+	return body, nil
 }
 
 parser_stmt_while :: proc(p: ^Parser, allocator := context.allocator) -> (stmt: Stmt, err: Error) {
@@ -1002,7 +1063,7 @@ parser_stmt_if :: proc(p: ^Parser, allocator := context.allocator) -> (stmt: Stm
 
 parser_decl :: proc(p: ^Parser, allocator := context.allocator) -> Stmt {
 	if parser_match(p, {.Var}) {
-		var, err := var_declaration(p, allocator)
+		var, err := parser_stmt_var_decl(p, allocator)
 		if err != nil {
 			parser_sync(p)
 			return nil
@@ -1017,7 +1078,7 @@ parser_decl :: proc(p: ^Parser, allocator := context.allocator) -> Stmt {
 	return stmt
 }
 
-var_declaration :: proc(
+parser_stmt_var_decl :: proc(
 	p: ^Parser,
 	allocator := context.allocator,
 ) -> (
