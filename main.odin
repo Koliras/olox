@@ -910,6 +910,12 @@ Stmt :: union {
 	^Stmt_Var,
 	^Stmt_Block,
 	^Stmt_If,
+	^Stmt_While,
+}
+
+Stmt_While :: struct {
+	condition: Expr,
+	body:      Stmt,
 }
 
 Stmt_Print :: struct {
@@ -956,10 +962,25 @@ parser_stmt :: proc(p: ^Parser, allocator := context.allocator) -> (Stmt, Error)
 	if parser_match(p, {.Print}) {
 		return parser_stmt_print(p, allocator)
 	}
+	if parser_match(p, {.While}) {
+		return parser_stmt_while(p, allocator)
+	}
 	if parser_match(p, {.Left_Brace}) {
 		return parser_stmt_block(p, allocator)
 	}
 	return parser_stmt_expression(p, allocator)
+}
+
+parser_stmt_while :: proc(p: ^Parser, allocator := context.allocator) -> (stmt: Stmt, err: Error) {
+	parser_consume(p, .Left_Paren, "Expect '(' after 'while'.") or_return
+	condition := parser_expression(p, allocator) or_return
+	parser_consume(p, .Right_Paren, "Expect ')' after condition.") or_return
+	body := parser_stmt(p, allocator) or_return
+
+	while_ := new(Stmt_While, allocator)
+	while_.body = body
+	while_.condition = condition
+	return while_, nil
 }
 
 parser_stmt_if :: proc(p: ^Parser, allocator := context.allocator) -> (stmt: Stmt, err: Error) {
@@ -1079,6 +1100,14 @@ stmt_execute :: proc(stmt: Stmt, env: ^Env, allocator := context.allocator) -> E
 			stmt_execute(v.branch_then, env) or_return
 		} else if v.branch_else != nil {
 			stmt_execute(v.branch_else, env) or_return
+		}
+	case (^Stmt_While):
+		for {
+			val := expr_to_value(v.condition, env) or_return
+			if !value_is_truthy(val) {
+				break
+			}
+			stmt_execute(v.body, env) or_return
 		}
 	}
 	return nil

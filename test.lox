@@ -1,13 +1,5 @@
-print nil or "string";
-print true and nil;
-var a = 1;
-{
-  var a = a + 2;
-  if (a < 2) {
-      print a;
-  } else {
-      print a + 6;
-  }
-  if (a>2) print "foo";
+var a = 0;
+while (a<10) {
+    a = a + 1;
+    print a;
 }
-print a;
