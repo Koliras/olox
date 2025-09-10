@@ -8,6 +8,7 @@ import "core:mem"
 import os "core:os/os2"
 import "core:strconv"
 import "core:strings"
+import "core:time"
 
 had_error := false
 had_runtime_error := false
@@ -96,8 +97,22 @@ run_code :: proc(code: string) {
 	if err != nil {
 		return
 	}
-	env := env_init()
-	stmt_interpret(expr[:], &env)
+	global_env := env_init()
+	env_define(&global_env, "clock", Function {
+		name = "clock",
+		call = proc(
+			fn: ^Function,
+			args: []Value,
+			env: ^Env,
+			allocator: runtime.Allocator,
+		) -> (
+			Value,
+			Error,
+		) {
+			return f64(time.tick_now()._nsec / 1_000_000_000), nil
+		},
+	})
+	stmt_interpret(expr[:], &global_env)
 }
 
 Scanner :: struct {
@@ -119,11 +134,32 @@ Token :: struct {
 	literal: Value,
 }
 
+Function :: struct {
+	call:  
+	proc(
+		fn: ^Function,
+		args: []Value,
+		env: ^Env,
+		allocator := context.allocator,
+	) -> (
+		Value,
+		Error,
+	),
+	params:
+	[]^Token,
+	body:  
+	[]Stmt,
+	name:  
+	string,
+}
+
 Value :: union {
 	string,
 	bool,
 	f64,
 	Object,
+	[dynamic]Value,
+	Function,
 }
 
 Object_Key :: union #no_nil {
@@ -204,9 +240,9 @@ scanner_advance :: proc(s: ^Scanner) -> byte {
 }
 
 scanner_scan_token :: proc(s: ^Scanner) {
-	c := scanner_advance(s)
+	ch := scanner_advance(s)
 
-	switch c {
+	switch ch {
 	case '(':
 		scanner_add_token(s, .Left_Paren, "(")
 	case ')':
@@ -253,7 +289,7 @@ scanner_scan_token :: proc(s: ^Scanner) {
 	case '>':
 		scanner_add_token(s, scanner_match(s, '=') ? .Greater_Equal : .Greater)
 	case:
-		if is_alpha(c) {
+		if is_alpha(ch) {
 			scanner_identifier(s)
 		} else {
 			report(s.line, fmt.tprintf("Unexpected character. %s", s.current))
@@ -418,13 +454,13 @@ report :: proc(line: int, message: ..string) {
 	had_error = true
 }
 
-error :: proc(token: ^Token, msg: string) -> Parse_Error_Unexpected_Token {
+error :: proc(token: ^Token, msg: string) -> Error {
 	if token.kind == .EOF {
 		report(token.line, " at the end. ", msg)
 	} else {
 		report(token.line, " at '", token.lexeme, "' ", msg)
 	}
-	return {token = token, message = msg}
+	return Parse_Error_Unexpected_Token{token = token, message = msg}
 }
 
 Expr :: union {
@@ -435,6 +471,13 @@ Expr :: union {
 	^Expr_Variable,
 	^Expr_Assignment,
 	^Expr_Logical,
+	^Expr_Call,
+}
+
+Expr_Call :: struct {
+	callee: Expr,
+	paren:  ^Token,
+	args:   []Expr,
 }
 
 Expr_Logical :: struct {
@@ -479,10 +522,17 @@ Parser :: struct {
 Error :: union {
 	Parse_Error_Unexpected_Token,
 	Error_Variable_Undefined,
+	Error_Incorrect_Args_Amount,
 }
 
 Error_Variable_Undefined :: struct {
 	name: ^Token,
+}
+
+Error_Incorrect_Args_Amount :: struct {
+	fn:       ^Token,
+	expected: int,
+	received: int,
 }
 
 
@@ -667,7 +717,56 @@ parser_unary :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, er
 		unary.right = right
 		return unary, nil
 	}
-	return parser_primary(p, allocator)
+	return parser_call(p, allocator)
+}
+
+parser_call :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Error) {
+	expr := parser_primary(p, allocator) or_return
+
+	for {
+		if parser_match(p, {.Left_Paren}) {
+			expr = parser_finish_call(p, expr, allocator) or_return
+		} else {
+			break
+		}
+	}
+	return expr, nil
+}
+
+parser_finish_call :: proc(
+	p: ^Parser,
+	callee: Expr,
+	allocator := context.allocator,
+) -> (
+	expr: Expr,
+	err: Error,
+) {
+	args := make([dynamic]Expr)
+	defer if err != nil {
+		delete(args)
+	}
+
+	if !parser_check(p, .Right_Paren) {
+		expr = parser_expression(p) or_return
+		append(&args, expr)
+
+		for parser_match(p, {.Comma}) {
+			if len(args) >= 255 {
+				_ = error(parser_peek(p), "Can't have more than 255 arguments.")
+			}
+			expr = parser_expression(p) or_return
+			append(&args, expr)
+		}
+	}
+
+	paren := parser_consume(p, .Right_Paren, "Expect ')' after arguments.") or_return
+
+	call := new(Expr_Call, allocator)
+	call.paren = paren
+	call.args = args[:]
+	call.callee = callee
+
+	return call, nil
 }
 
 parser_primary :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Error) {
@@ -826,6 +925,33 @@ expr_to_value :: proc(
 		}
 
 		return expr_to_value(v.right, env)
+	case (^Expr_Call):
+		callee := expr_to_value(v.callee, env) or_return
+		fn, is_fn := callee.(Function)
+		if !is_fn {
+			return nil, Parse_Error_Unexpected_Token {
+				token = v.paren,
+				message = "Can only call functions and classes",
+			}
+		}
+		args := make([dynamic]Value)
+		defer {
+			delete(args)
+		}
+
+		for arg in v.args {
+			val := expr_to_value(arg, env) or_return
+			append(&args, val)
+		}
+
+		if len(fn.params) != len(args) {
+			return nil, Error_Incorrect_Args_Amount {
+				fn = v.paren,
+				expected = len(fn.params),
+				received = len(args),
+			}
+		}
+		fn->call(args[:], env)
 	}
 	return nil, nil
 }
@@ -843,21 +969,26 @@ value_is_truthy :: proc(v: Value) -> bool {
 values_are_equal :: proc(left, right: Value) -> bool {
 	switch l in left {
 	case bool:
-		r, ok := right.(bool)
-		if !ok do return false
+		r := right.(bool) or_return
 		return l == r
 	case string:
-		r, ok := right.(string)
-		if !ok do return false
+		r := right.(string) or_return
 		return l == r
 	case f64:
-		r, ok := right.(f64)
-		if !ok do return false
+		r := right.(f64) or_return
 		return l == r
 	case Object:
-		r, ok := right.(Object)
-		if !ok do return false
+		r := right.(Object) or_return
 		return (transmute(runtime.Raw_Map)l).data == (transmute(runtime.Raw_Map)r).data
+	case [dynamic]Value:
+		r := right.([dynamic]Value) or_return
+		return(
+			len(r) == len(l) &&
+			((transmute(runtime.Raw_Dynamic_Array)l).data ==
+					(transmute(runtime.Raw_Dynamic_Array)r).data) \
+		)
+	case Function:
+		return false
 	case nil:
 		if right == nil do return true
 		return false
@@ -900,6 +1031,13 @@ runtime_error :: proc(err: Error) {
 		fmt.eprintfln("[line %d]: %s", v.token.line, v.message)
 	case Error_Variable_Undefined:
 		fmt.eprintfln("Undefined variable '%s' at line %d.", v.name.lexeme, v.name.line)
+	case Error_Incorrect_Args_Amount:
+		fmt.eprintfln(
+			"[line %d]: Expected %d arguments, received %d instead.",
+			v.fn.line,
+			v.expected,
+			v.received,
+		)
 	}
 	had_runtime_error = true
 }
@@ -911,6 +1049,7 @@ Stmt :: union {
 	^Stmt_Block,
 	^Stmt_If,
 	^Stmt_While,
+	^Stmt_Function,
 }
 
 Stmt_While :: struct {
@@ -941,6 +1080,21 @@ Stmt_If :: struct {
 	branch_else: Stmt,
 }
 
+Stmt_Function :: struct {
+	name:   ^Token,
+	params: []^Token,
+	body:   []Stmt,
+	call:   proc(
+		fn: ^Function,
+		args: []Value,
+		env: ^Env,
+		allocator := context.allocator,
+	) -> (
+		Value,
+		Error,
+	),
+}
+
 env_execute_block :: proc(outer_env: ^Env, stmts: []Stmt, allocator := context.allocator) {
 	env := Env {
 		enclosing = outer_env,
@@ -950,9 +1104,18 @@ env_execute_block :: proc(outer_env: ^Env, stmts: []Stmt, allocator := context.a
 	for stmt in stmts {
 		stmt_execute(stmt, &env, allocator)
 	}
-	defer {
-		delete(env.values)
+	for _, val in env.values {
+		a := val
+		#partial switch &v in val {
+		case string:
+			free(&v)
+		case [dynamic]Value:
+			delete_dynamic_array(v)
+		case Object:
+			delete_map(v)
+		}
 	}
+	delete(env.values)
 }
 
 parser_stmt :: proc(p: ^Parser, allocator := context.allocator) -> (Stmt, Error) {
@@ -1062,6 +1225,14 @@ parser_stmt_if :: proc(p: ^Parser, allocator := context.allocator) -> (stmt: Stm
 }
 
 parser_decl :: proc(p: ^Parser, allocator := context.allocator) -> Stmt {
+	if parser_match(p, {.Fun}) {
+		fn, err := parser_stmt_function(p, allocator)
+		if err != nil {
+			parser_sync(p)
+			return nil
+		}
+		return fn
+	}
 	if parser_match(p, {.Var}) {
 		var, err := parser_stmt_var_decl(p, allocator)
 		if err != nil {
@@ -1077,6 +1248,54 @@ parser_decl :: proc(p: ^Parser, allocator := context.allocator) -> Stmt {
 	}
 	return stmt
 }
+
+parser_stmt_function :: proc(
+	p: ^Parser,
+	allocator := context.allocator,
+	is_method := false,
+) -> (
+	stmt: ^Stmt_Function,
+	err: Error,
+) {
+	name := parser_consume(
+		p,
+		.Identifier,
+		is_method ? "Expect method name." : "Expect function name.",
+	) or_return
+
+	parser_consume(
+		p,
+		.Left_Paren,
+		is_method ? "Expect '(' after method name." : "Expect '(' after function name.",
+	) or_return
+	params := make([dynamic]^Token, allocator)
+	defer if err != nil {
+		delete(params)
+	}
+
+	if !parser_check(p, .Right_Paren) {
+		tkn := parser_consume(p, .Identifier, "Expect parameter name.") or_return
+		append(&params, tkn)
+
+		for parser_match(p, {.Comma}) {
+			if len(params) >= 255 {
+				error(parser_peek(p), "Can't have more than 255 parameters.")
+			}
+			tkn := parser_consume(p, .Identifier, "Expect parameter name.") or_return
+			append(&params, tkn)
+		}
+	}
+	parser_consume(p, .Right_Paren, "Expect ')' after parameters.") or_return
+	parser_consume(p, .Left_Brace, "Expect '{' before body.") or_return
+	block := parser_block(p, allocator) or_return
+	fn := new(Stmt_Function, allocator)
+	fn.params = params[:]
+	fn.body = block
+	fn.name = name
+	fn.call = function_call
+	return fn, nil
+}
+
 
 parser_stmt_var_decl :: proc(
 	p: ^Parser,
@@ -1146,7 +1365,8 @@ stmt_execute :: proc(stmt: Stmt, env: ^Env, allocator := context.allocator) -> E
 		expr_to_value(v.expr, env) or_return
 	case (^Stmt_Print):
 		val := expr_to_value(v.expr, env) or_return
-		fmt.printfln("%#v", val)
+		str := value_to_string(val)
+		fmt.println(str)
 	case (^Stmt_Var):
 		val: Value
 		if v.initializer != nil {
@@ -1170,6 +1390,14 @@ stmt_execute :: proc(stmt: Stmt, env: ^Env, allocator := context.allocator) -> E
 			}
 			stmt_execute(v.body, env) or_return
 		}
+	case (^Stmt_Function):
+		fn := Function {
+			body   = v.body,
+			params = v.params,
+			call   = v.call,
+			name   = v.name.lexeme,
+		}
+		env_define(env, v.name.lexeme, fn)
 	}
 	return nil
 }
@@ -1207,4 +1435,44 @@ env_assign :: proc(env: ^Env, name: ^Token, val: Value) -> Error {
 		return env_assign(env.enclosing, name, val)
 	}
 	return Error_Variable_Undefined{name = name}
+}
+
+value_to_string :: proc(val: Value, allocator := context.allocator) -> string {
+	switch v in val {
+	case string:
+		return v
+	case nil, f64, bool, Object, [dynamic]Value:
+		return fmt.aprintf("%#v", v, allocator = allocator)
+	case Function:
+		if v.call == function_call {
+			return fmt.aprintf("<fn %s>", v.name)
+		} else {
+			return fmt.aprintf("<native fn %s>", v.name)
+		}
+	}
+	return ""
+}
+
+function_call :: proc(
+	fn: ^Function,
+	args: []Value,
+	env: ^Env,
+	allocator := context.allocator,
+) -> (
+	Value,
+	Error,
+) {
+	fn_env := new(Env, allocator)
+	defer free(fn_env)
+	fn_env.enclosing = env
+
+	for i in 0 ..< len(args) {
+		env_define(fn_env, fn.params[i].lexeme, args[i])
+	}
+	env_execute_block(fn_env, fn.body, allocator)
+	return nil, nil
+}
+
+expr_call_to_function :: proc(expr: ^Expr_Call) -> ^Stmt_Function {
+	return nil
 }
