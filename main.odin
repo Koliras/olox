@@ -523,6 +523,7 @@ Error :: union {
 	Parse_Error_Unexpected_Token,
 	Error_Variable_Undefined,
 	Error_Incorrect_Args_Amount,
+	Error_Return_Propagation,
 }
 
 Error_Variable_Undefined :: struct {
@@ -533,6 +534,11 @@ Error_Incorrect_Args_Amount :: struct {
 	fn:       ^Token,
 	expected: int,
 	received: int,
+}
+
+// Not actually an error, just a way to easily propagate returned value to the call place
+Error_Return_Propagation :: struct {
+	val: Value,
 }
 
 
@@ -951,7 +957,7 @@ expr_to_value :: proc(
 				received = len(args),
 			}
 		}
-		fn->call(args[:], env)
+		return fn->call(args[:], env)
 	}
 	return nil, nil
 }
@@ -1038,6 +1044,7 @@ runtime_error :: proc(err: Error) {
 			v.expected,
 			v.received,
 		)
+	case Error_Return_Propagation: // should never happen as it is return mechanism
 	}
 	had_runtime_error = true
 }
@@ -1050,6 +1057,7 @@ Stmt :: union {
 	^Stmt_If,
 	^Stmt_While,
 	^Stmt_Function,
+	^Stmt_Return,
 }
 
 Stmt_While :: struct {
@@ -1095,27 +1103,25 @@ Stmt_Function :: struct {
 	),
 }
 
-env_execute_block :: proc(outer_env: ^Env, stmts: []Stmt, allocator := context.allocator) {
+Stmt_Return :: struct {
+	keyword: ^Token,
+	value:   Expr,
+}
+
+env_execute_block :: proc(
+	outer_env: ^Env,
+	stmts: []Stmt,
+	allocator := context.allocator,
+) -> Error {
 	env := Env {
 		enclosing = outer_env,
 		values    = make(map[string]Value, allocator),
 	}
 
 	for stmt in stmts {
-		stmt_execute(stmt, &env, allocator)
+		stmt_execute(stmt, &env, allocator) or_return
 	}
-	for _, val in env.values {
-		a := val
-		#partial switch &v in val {
-		case string:
-			free(&v)
-		case [dynamic]Value:
-			delete_dynamic_array(v)
-		case Object:
-			delete_map(v)
-		}
-	}
-	delete(env.values)
+	return nil
 }
 
 parser_stmt :: proc(p: ^Parser, allocator := context.allocator) -> (Stmt, Error) {
@@ -1127,6 +1133,9 @@ parser_stmt :: proc(p: ^Parser, allocator := context.allocator) -> (Stmt, Error)
 	}
 	if parser_match(p, {.Print}) {
 		return parser_stmt_print(p, allocator)
+	}
+	if parser_match(p, {.Return}) {
+		return parser_stmt_return(p, allocator)
 	}
 	if parser_match(p, {.While}) {
 		return parser_stmt_while(p, allocator)
@@ -1193,6 +1202,26 @@ parser_stmt_for :: proc(p: ^Parser, allocator := context.allocator) -> (stmt: St
 	}
 
 	return body, nil
+}
+
+parser_stmt_return :: proc(
+	p: ^Parser,
+	allocator := context.allocator,
+) -> (
+	stmt: Stmt,
+	err: Error,
+) {
+	keyword := parser_prev(p)
+	val: Expr
+
+	if !parser_check(p, .Semicolon) {
+		val = parser_expression(p, allocator) or_return
+	}
+	parser_consume(p, .Semicolon, "Expect ';' after return value.") or_return
+	ret := new(Stmt_Return, allocator)
+	ret.value = val
+	ret.keyword = keyword
+	return ret, nil
 }
 
 parser_stmt_while :: proc(p: ^Parser, allocator := context.allocator) -> (stmt: Stmt, err: Error) {
@@ -1374,7 +1403,7 @@ stmt_execute :: proc(stmt: Stmt, env: ^Env, allocator := context.allocator) -> E
 		}
 		env_define(env, v.name.lexeme, val)
 	case (^Stmt_Block):
-		env_execute_block(env, v.statements, allocator)
+		env_execute_block(env, v.statements, allocator) or_return
 	case (^Stmt_If):
 		val := expr_to_value(v.condition, env) or_return
 		if value_is_truthy(val) {
@@ -1398,6 +1427,13 @@ stmt_execute :: proc(stmt: Stmt, env: ^Env, allocator := context.allocator) -> E
 			name   = v.name.lexeme,
 		}
 		env_define(env, v.name.lexeme, fn)
+	case (^Stmt_Return):
+		val: Value
+		if v.value != nil {
+			val = expr_to_value(v.value, env, allocator) or_return
+		}
+
+		return Error_Return_Propagation{val}
 	}
 	return nil
 }
@@ -1469,10 +1505,10 @@ function_call :: proc(
 	for i in 0 ..< len(args) {
 		env_define(fn_env, fn.params[i].lexeme, args[i])
 	}
-	env_execute_block(fn_env, fn.body, allocator)
-	return nil, nil
-}
-
-expr_call_to_function :: proc(expr: ^Expr_Call) -> ^Stmt_Function {
-	return nil
+	possible_err := env_execute_block(fn_env, fn.body, allocator)
+	result, is_result := possible_err.(Error_Return_Propagation)
+	if is_result {
+		return result.val, nil
+	}
+	return nil, possible_err
 }
