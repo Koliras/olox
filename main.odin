@@ -98,20 +98,25 @@ run_code :: proc(code: string) {
 		return
 	}
 	global_env := env_init()
-	env_define(&global_env, "clock", Function {
-		name = "clock",
-		call = proc(
-			fn: ^Function,
-			args: []Value,
-			env: ^Env,
-			allocator: runtime.Allocator,
-		) -> (
-			Value,
-			Error,
-		) {
-			return f64(time.tick_now()._nsec / 1_000_000_000), nil
+	env_define(
+		&global_env,
+		"clock",
+		Function {
+			decl = &Stmt_Function {
+				name = &Token{lexeme = "clock", kind = .Identifier},
+				call = proc(
+					fn: ^Function,
+					args: []Value,
+					allocator: runtime.Allocator,
+				) -> (
+					Value,
+					Error,
+				) {
+					return f64(time.tick_now()._nsec / 1_000_000_000), nil
+				},
+			},
 		},
-	})
+	)
 	stmt_interpret(expr[:], &global_env)
 }
 
@@ -135,22 +140,8 @@ Token :: struct {
 }
 
 Function :: struct {
-	call:  
-	proc(
-		fn: ^Function,
-		args: []Value,
-		env: ^Env,
-		allocator := context.allocator,
-	) -> (
-		Value,
-		Error,
-	),
-	params:
-	[]^Token,
-	body:  
-	[]Stmt,
-	name:  
-	string,
+	decl:    ^Stmt_Function,
+	closure: ^Env,
 }
 
 Value :: union {
@@ -950,14 +941,14 @@ expr_to_value :: proc(
 			append(&args, val)
 		}
 
-		if len(fn.params) != len(args) {
+		if len(fn.decl.params) != len(args) {
 			return nil, Error_Incorrect_Args_Amount {
 				fn = v.paren,
-				expected = len(fn.params),
+				expected = len(fn.decl.params),
 				received = len(args),
 			}
 		}
-		return fn->call(args[:], env)
+		return fn.decl.call(&fn, args[:], allocator)
 	}
 	return nil, nil
 }
@@ -1092,15 +1083,7 @@ Stmt_Function :: struct {
 	name:   ^Token,
 	params: []^Token,
 	body:   []Stmt,
-	call:   proc(
-		fn: ^Function,
-		args: []Value,
-		env: ^Env,
-		allocator := context.allocator,
-	) -> (
-		Value,
-		Error,
-	),
+	call:   proc(fn: ^Function, args: []Value, allocator := context.allocator) -> (Value, Error),
 }
 
 Stmt_Return :: struct {
@@ -1113,13 +1096,12 @@ env_execute_block :: proc(
 	stmts: []Stmt,
 	allocator := context.allocator,
 ) -> Error {
-	env := Env {
-		enclosing = outer_env,
-		values    = make(map[string]Value, allocator),
-	}
+	env := new(Env, allocator)
+	env.enclosing = outer_env
+	env.values = make(map[string]Value, allocator)
 
 	for stmt in stmts {
-		stmt_execute(stmt, &env, allocator) or_return
+		stmt_execute(stmt, env, allocator) or_return
 	}
 	return nil
 }
@@ -1421,10 +1403,8 @@ stmt_execute :: proc(stmt: Stmt, env: ^Env, allocator := context.allocator) -> E
 		}
 	case (^Stmt_Function):
 		fn := Function {
-			body   = v.body,
-			params = v.params,
-			call   = v.call,
-			name   = v.name.lexeme,
+			decl    = v,
+			closure = env,
 		}
 		env_define(env, v.name.lexeme, fn)
 	case (^Stmt_Return):
@@ -1480,10 +1460,10 @@ value_to_string :: proc(val: Value, allocator := context.allocator) -> string {
 	case nil, f64, bool, Object, [dynamic]Value:
 		return fmt.aprintf("%#v", v, allocator = allocator)
 	case Function:
-		if v.call == function_call {
-			return fmt.aprintf("<fn %s>", v.name)
+		if v.decl.call == function_call {
+			return fmt.aprintf("<fn %s>", v.decl.name.lexeme)
 		} else {
-			return fmt.aprintf("<native fn %s>", v.name)
+			return fmt.aprintf("<native fn %s>", v.decl.name.lexeme)
 		}
 	}
 	return ""
@@ -1492,7 +1472,6 @@ value_to_string :: proc(val: Value, allocator := context.allocator) -> string {
 function_call :: proc(
 	fn: ^Function,
 	args: []Value,
-	env: ^Env,
 	allocator := context.allocator,
 ) -> (
 	Value,
@@ -1500,12 +1479,12 @@ function_call :: proc(
 ) {
 	fn_env := new(Env, allocator)
 	defer free(fn_env)
-	fn_env.enclosing = env
+	fn_env.enclosing = fn.closure
 
 	for i in 0 ..< len(args) {
-		env_define(fn_env, fn.params[i].lexeme, args[i])
+		env_define(fn_env, fn.decl.params[i].lexeme, args[i])
 	}
-	possible_err := env_execute_block(fn_env, fn.body, allocator)
+	possible_err := env_execute_block(fn_env, fn.decl.body, allocator)
 	result, is_result := possible_err.(Error_Return_Propagation)
 	if is_result {
 		return result.val, nil
