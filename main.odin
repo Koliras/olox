@@ -463,6 +463,11 @@ Expr :: union {
 	^Expr_Assignment,
 	^Expr_Logical,
 	^Expr_Call,
+	^Expr_Lambda,
+}
+
+Expr_Lambda :: struct {
+	fn: ^Stmt_Function,
 }
 
 Expr_Call :: struct {
@@ -639,6 +644,37 @@ parser_comparison :: proc(p: ^Parser, allocator := context.allocator) -> (e: Exp
 	return expr, nil
 }
 
+parser_lambda :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Error) {
+	parser_consume(p, .Left_Paren, "Expect '(' after 'fun' keyword name.") or_return
+	params := make([dynamic]^Token, allocator)
+	defer if err != nil {
+		delete(params)
+	}
+
+	if !parser_check(p, .Right_Paren) {
+		tkn := parser_consume(p, .Identifier, "Expect parameter name.") or_return
+		append(&params, tkn)
+
+		for parser_match(p, {.Comma}) {
+			if len(params) >= 255 {
+				error(parser_peek(p), "Can't have more than 255 parameters.")
+			}
+			tkn := parser_consume(p, .Identifier, "Expect parameter name.") or_return
+			append(&params, tkn)
+		}
+	}
+	parser_consume(p, .Right_Paren, "Expect ')' after parameters.") or_return
+	parser_consume(p, .Left_Brace, "Expect '{' before body.") or_return
+	block := parser_block(p, allocator) or_return
+	lambda := new(Expr_Lambda, allocator)
+	fn := new(Stmt_Function, allocator)
+	fn.params = params[:]
+	fn.body = block
+	fn.call = function_call
+	lambda.fn = fn
+	return lambda, nil
+}
+
 parser_match :: proc(p: ^Parser, tokens: []Token_Kind) -> bool {
 	for kind in tokens {
 		if parser_check(p, kind) {
@@ -806,6 +842,10 @@ parser_primary :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, 
 		return group, nil
 	}
 
+	if parser_match(p, {.Fun}) {
+		return parser_lambda(p, allocator)
+	}
+
 	return {}, error(parser_peek(p), "Expect expression.")
 }
 
@@ -949,6 +989,11 @@ expr_to_value :: proc(
 			}
 		}
 		return fn.decl.call(&fn, args[:], allocator)
+	case (^Expr_Lambda):
+		fn := Function{}
+		fn.decl = v.fn
+		fn.closure = env
+		return fn, nil
 	}
 	return nil, nil
 }
