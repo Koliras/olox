@@ -93,18 +93,24 @@ run_code :: proc(code: string) {
 	tokens := scanner_scan_tokens(&scanner)
 
 	p := parser_from_tokens(tokens)
-	expr, err := parser_parse(&p)
+	stmts, err := parser_parse(&p)
 	if err != nil {
 		return
 	}
 	global_env := env_init()
+	interpreter := Interpreter {
+		globals = &global_env,
+		env     = &global_env,
+		locals  = make(map[Expr]int),
+	}
 	env_define(
-		&global_env,
+		interpreter.globals,
 		"clock",
 		Function {
 			decl = &Stmt_Function {
 				name = &Token{lexeme = "clock", kind = .Identifier},
 				call = proc(
+					i: ^Interpreter,
 					fn: ^Function,
 					args: []Value,
 					allocator: runtime.Allocator,
@@ -117,7 +123,19 @@ run_code :: proc(code: string) {
 			},
 		},
 	)
-	stmt_interpret(expr[:], &global_env)
+	resolver := Resolver{}
+	resolver_init(&resolver, &interpreter)
+	resolver_resolve_stmts(&resolver, stmts[:])
+	if had_error {
+		return
+	}
+	interpreter_interpret(&interpreter, stmts[:])
+}
+
+Interpreter :: struct {
+	globals: ^Env,
+	env:     ^Env,
+	locals:  map[Expr]int,
 }
 
 Scanner :: struct {
@@ -451,7 +469,7 @@ error :: proc(token: ^Token, msg: string) -> Error {
 	} else {
 		report(token.line, " at '", token.lexeme, "' ", msg)
 	}
-	return Parse_Error_Unexpected_Token{token = token, message = msg}
+	return Error_Unexpected_Token{token = token, message = msg}
 }
 
 Expr :: union {
@@ -463,11 +481,6 @@ Expr :: union {
 	^Expr_Assignment,
 	^Expr_Logical,
 	^Expr_Call,
-	^Expr_Lambda,
-}
-
-Expr_Lambda :: struct {
-	fn: ^Stmt_Function,
 }
 
 Expr_Call :: struct {
@@ -516,7 +529,7 @@ Parser :: struct {
 }
 
 Error :: union {
-	Parse_Error_Unexpected_Token,
+	Error_Unexpected_Token,
 	Error_Variable_Undefined,
 	Error_Incorrect_Args_Amount,
 	Error_Return_Propagation,
@@ -538,7 +551,7 @@ Error_Return_Propagation :: struct {
 }
 
 
-Parse_Error_Unexpected_Token :: struct {
+Error_Unexpected_Token :: struct {
 	token:   ^Token,
 	message: string,
 }
@@ -642,37 +655,6 @@ parser_comparison :: proc(p: ^Parser, allocator := context.allocator) -> (e: Exp
 		expr = bin
 	}
 	return expr, nil
-}
-
-parser_lambda :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err: Error) {
-	parser_consume(p, .Left_Paren, "Expect '(' after 'fun' keyword name.") or_return
-	params := make([dynamic]^Token, allocator)
-	defer if err != nil {
-		delete(params)
-	}
-
-	if !parser_check(p, .Right_Paren) {
-		tkn := parser_consume(p, .Identifier, "Expect parameter name.") or_return
-		append(&params, tkn)
-
-		for parser_match(p, {.Comma}) {
-			if len(params) >= 255 {
-				error(parser_peek(p), "Can't have more than 255 parameters.")
-			}
-			tkn := parser_consume(p, .Identifier, "Expect parameter name.") or_return
-			append(&params, tkn)
-		}
-	}
-	parser_consume(p, .Right_Paren, "Expect ')' after parameters.") or_return
-	parser_consume(p, .Left_Brace, "Expect '{' before body.") or_return
-	block := parser_block(p, allocator) or_return
-	lambda := new(Expr_Lambda, allocator)
-	fn := new(Stmt_Function, allocator)
-	fn.params = params[:]
-	fn.body = block
-	fn.call = function_call
-	lambda.fn = fn
-	return lambda, nil
 }
 
 parser_match :: proc(p: ^Parser, tokens: []Token_Kind) -> bool {
@@ -842,10 +824,6 @@ parser_primary :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, 
 		return group, nil
 	}
 
-	if parser_match(p, {.Fun}) {
-		return parser_lambda(p, allocator)
-	}
-
 	return {}, error(parser_peek(p), "Expect expression.")
 }
 
@@ -871,9 +849,9 @@ parser_sync :: proc(p: ^Parser) {
 	}
 }
 
-expr_to_value :: proc(
+interpreter_expr_to_value :: proc(
+	i: ^Interpreter,
 	expr: Expr,
-	env: ^Env,
 	allocator := context.allocator,
 ) -> (
 	v: Value,
@@ -881,11 +859,11 @@ expr_to_value :: proc(
 ) {
 	switch v in expr {
 	case (^Expr_Grouping):
-		return expr_to_value(v.expression, env, allocator)
+		return interpreter_expr_to_value(i, v.expression, allocator)
 	case (^Expr_Literal):
 		return v.value, nil
 	case (^Expr_Unary):
-		right := expr_to_value(v.right, env, allocator) or_return
+		right := interpreter_expr_to_value(i, v.right, allocator) or_return
 
 		#partial switch v.operator.kind {
 		case .Minus:
@@ -896,8 +874,8 @@ expr_to_value :: proc(
 		}
 		return nil, nil // unreachebale
 	case (^Expr_Binary):
-		left := expr_to_value(v.left, env, allocator) or_return
-		right := expr_to_value(v.right, env, allocator) or_return
+		left := interpreter_expr_to_value(i, v.left, allocator) or_return
+		right := interpreter_expr_to_value(i, v.right, allocator) or_return
 		#partial switch v.operator.kind {
 		case .Minus:
 			operands_are_numbers(v.operator, left, right) or_return
@@ -920,7 +898,7 @@ expr_to_value :: proc(
 				res := strings.concatenate({l_str, r_str}, allocator)
 				return res, nil
 			}
-			return nil, Parse_Error_Unexpected_Token {
+			return nil, Error_Unexpected_Token {
 				token = v.operator,
 				message = "Operands must both be numbers or strings",
 			}
@@ -942,17 +920,23 @@ expr_to_value :: proc(
 			return values_are_equal(left, right), nil
 		}
 	case (^Expr_Variable):
-		val, ok := env_get(env, v.name.lexeme)
+		val, ok := env_get(i.env, v.name.lexeme)
 		if !ok {
 			return nil, Error_Variable_Undefined{name = v.name}
 		}
 		return val, nil
 	case (^Expr_Assignment):
-		val := expr_to_value(v.value, env) or_return
-		env_assign(env, v.name, val) or_return
+		val := interpreter_expr_to_value(i, v.value, allocator) or_return
+		distance, has_distance := i.locals[v]
+
+		if has_distance {
+			env_assign_at(i.env, distance, v.name.lexeme, val)
+		} else {
+			env_assign(i.globals, v.name, val) or_return
+		}
 		return val, nil
 	case (^Expr_Logical):
-		left := expr_to_value(v.left, env) or_return
+		left := interpreter_expr_to_value(i, v.left, allocator) or_return
 
 		is_truthy := value_is_truthy(left)
 		if v.operator.kind == .Or {
@@ -961,12 +945,12 @@ expr_to_value :: proc(
 			if !is_truthy do return left, nil
 		}
 
-		return expr_to_value(v.right, env)
+		return interpreter_expr_to_value(i, v.right, allocator)
 	case (^Expr_Call):
-		callee := expr_to_value(v.callee, env) or_return
+		callee := interpreter_expr_to_value(i, v.callee, allocator) or_return
 		fn, is_fn := callee.(Function)
 		if !is_fn {
-			return nil, Parse_Error_Unexpected_Token {
+			return nil, Error_Unexpected_Token {
 				token = v.paren,
 				message = "Can only call functions and classes",
 			}
@@ -977,7 +961,7 @@ expr_to_value :: proc(
 		}
 
 		for arg in v.args {
-			val := expr_to_value(arg, env) or_return
+			val := interpreter_expr_to_value(i, arg, allocator) or_return
 			append(&args, val)
 		}
 
@@ -988,12 +972,7 @@ expr_to_value :: proc(
 				received = len(args),
 			}
 		}
-		return fn.decl.call(&fn, args[:], allocator)
-	case (^Expr_Lambda):
-		fn := Function{}
-		fn.decl = v.fn
-		fn.closure = env
-		return fn, nil
+		return fn.decl.call(i, &fn, args[:], allocator)
 	}
 	return nil, nil
 }
@@ -1043,7 +1022,7 @@ operand_is_number :: proc(tkn: ^Token, operand: Value) -> Error {
 	if is_num {
 		return nil
 	} else {
-		return Parse_Error_Unexpected_Token{token = tkn, message = "Operand must be a number."}
+		return Error_Unexpected_Token{token = tkn, message = "Operand must be a number."}
 	}
 }
 operands_are_numbers :: proc(tkn: ^Token, left, right: Value) -> Error {
@@ -1052,13 +1031,13 @@ operands_are_numbers :: proc(tkn: ^Token, left, right: Value) -> Error {
 	if left_num && right_num {
 		return nil
 	} else {
-		return Parse_Error_Unexpected_Token{token = tkn, message = "Operands must be numbers."}
+		return Error_Unexpected_Token{token = tkn, message = "Operands must be numbers."}
 	}
 }
 
-stmt_interpret :: proc(stmts: []Stmt, env: ^Env) {
+interpreter_interpret :: proc(i: ^Interpreter, stmts: []Stmt) {
 	for s in stmts {
-		err := stmt_execute(s, env)
+		err := interpreter_stmt_execute(i, s)
 		if err != nil {
 			runtime_error(err)
 			break
@@ -1069,7 +1048,7 @@ stmt_interpret :: proc(stmts: []Stmt, env: ^Env) {
 runtime_error :: proc(err: Error) {
 	if err == nil do return
 	switch v in err {
-	case Parse_Error_Unexpected_Token:
+	case Error_Unexpected_Token:
 		fmt.eprintfln("[line %d]: %s", v.token.line, v.message)
 	case Error_Variable_Undefined:
 		fmt.eprintfln("Undefined variable '%s' at line %d.", v.name.lexeme, v.name.line)
@@ -1128,7 +1107,15 @@ Stmt_Function :: struct {
 	name:   ^Token,
 	params: []^Token,
 	body:   []Stmt,
-	call:   proc(fn: ^Function, args: []Value, allocator := context.allocator) -> (Value, Error),
+	call:   proc(
+		i: ^Interpreter,
+		fn: ^Function,
+		args: []Value,
+		allocator := context.allocator,
+	) -> (
+		Value,
+		Error,
+	),
 }
 
 Stmt_Return :: struct {
@@ -1136,17 +1123,20 @@ Stmt_Return :: struct {
 	value:   Expr,
 }
 
-env_execute_block :: proc(
-	outer_env: ^Env,
+interpreter_execute_block :: proc(
+	i: ^Interpreter,
 	stmts: []Stmt,
+	new_env: ^Env,
 	allocator := context.allocator,
 ) -> Error {
-	env := new(Env, allocator)
-	env.enclosing = outer_env
-	env.values = make(map[string]Value, allocator)
+	prev_env := i.env
+	i.env = new_env
+	defer {
+		i.env = prev_env
+	}
 
 	for stmt in stmts {
-		stmt_execute(stmt, env, allocator) or_return
+		interpreter_stmt_execute(i, stmt, allocator) or_return
 	}
 	return nil
 }
@@ -1348,7 +1338,7 @@ parser_stmt_function :: proc(
 	fn.params = params[:]
 	fn.body = block
 	fn.name = name
-	fn.call = function_call
+	fn.call = interpreter_function_call
 	return fn, nil
 }
 
@@ -1415,47 +1405,54 @@ parser_block :: proc(p: ^Parser, allocator := context.allocator) -> ([]Stmt, Err
 	return stmts[:], nil
 }
 
-stmt_execute :: proc(stmt: Stmt, env: ^Env, allocator := context.allocator) -> Error {
+interpreter_stmt_execute :: proc(
+	i: ^Interpreter,
+	stmt: Stmt,
+	allocator := context.allocator,
+) -> Error {
 	switch v in stmt {
 	case (^Stmt_Expr):
-		expr_to_value(v.expr, env) or_return
+		interpreter_expr_to_value(i, v.expr, allocator) or_return
 	case (^Stmt_Print):
-		val := expr_to_value(v.expr, env) or_return
+		val := interpreter_expr_to_value(i, v.expr, allocator) or_return
 		str := value_to_string(val)
 		fmt.println(str)
 	case (^Stmt_Var):
 		val: Value
 		if v.initializer != nil {
-			val = expr_to_value(v.initializer, env) or_return
+			val = interpreter_expr_to_value(i, v.initializer, allocator) or_return
 		}
-		env_define(env, v.name.lexeme, val)
+		env_define(i.env, v.name.lexeme, val)
 	case (^Stmt_Block):
-		env_execute_block(env, v.statements, allocator) or_return
+		new_env := new(Env, allocator)
+		new_env.enclosing = i.env
+		new_env.values = make(map[string]Value, allocator)
+		interpreter_execute_block(i, v.statements, new_env, allocator) or_return
 	case (^Stmt_If):
-		val := expr_to_value(v.condition, env) or_return
+		val := interpreter_expr_to_value(i, v.condition, allocator) or_return
 		if value_is_truthy(val) {
-			stmt_execute(v.branch_then, env) or_return
+			interpreter_stmt_execute(i, v.branch_then, allocator) or_return
 		} else if v.branch_else != nil {
-			stmt_execute(v.branch_else, env) or_return
+			interpreter_stmt_execute(i, v.branch_else, allocator) or_return
 		}
 	case (^Stmt_While):
 		for {
-			val := expr_to_value(v.condition, env) or_return
+			val := interpreter_expr_to_value(i, v.condition, allocator) or_return
 			if !value_is_truthy(val) {
 				break
 			}
-			stmt_execute(v.body, env) or_return
+			interpreter_stmt_execute(i, v.body, allocator) or_return
 		}
 	case (^Stmt_Function):
 		fn := Function {
 			decl    = v,
-			closure = env,
+			closure = i.env,
 		}
-		env_define(env, v.name.lexeme, fn)
+		env_define(i.env, v.name.lexeme, fn)
 	case (^Stmt_Return):
 		val: Value
 		if v.value != nil {
-			val = expr_to_value(v.value, env, allocator) or_return
+			val = interpreter_expr_to_value(i, v.value, allocator) or_return
 		}
 
 		return Error_Return_Propagation{val}
@@ -1505,7 +1502,7 @@ value_to_string :: proc(val: Value, allocator := context.allocator) -> string {
 	case nil, f64, bool, Object, [dynamic]Value:
 		return fmt.aprintf("%#v", v, allocator = allocator)
 	case Function:
-		if v.decl.call == function_call {
+		if v.decl.call == interpreter_function_call {
 			return fmt.aprintf("<fn %s>", v.decl.name.lexeme)
 		} else {
 			return fmt.aprintf("<native fn %s>", v.decl.name.lexeme)
@@ -1514,7 +1511,8 @@ value_to_string :: proc(val: Value, allocator := context.allocator) -> string {
 	return ""
 }
 
-function_call :: proc(
+interpreter_function_call :: proc(
+	i: ^Interpreter,
 	fn: ^Function,
 	args: []Value,
 	allocator := context.allocator,
@@ -1529,10 +1527,228 @@ function_call :: proc(
 	for i in 0 ..< len(args) {
 		env_define(fn_env, fn.decl.params[i].lexeme, args[i])
 	}
-	possible_err := env_execute_block(fn_env, fn.decl.body, allocator)
+	possible_err := interpreter_execute_block(i, fn.decl.body, fn_env, allocator)
 	result, is_result := possible_err.(Error_Return_Propagation)
 	if is_result {
 		return result.val, nil
 	}
 	return nil, possible_err
+}
+
+Resolver :: struct {
+	scopes:           [dynamic]map[string]bool,
+	interpreter:      ^Interpreter,
+	current_function: Resolver_Function_Type,
+}
+
+Resolver_Function_Type :: enum u8 {
+	None,
+	Function,
+}
+
+resolver_init :: proc(
+	r: ^Resolver,
+	interpreter: ^Interpreter = nil,
+	allocator := context.allocator,
+) {
+	r.scopes = make([dynamic]map[string]bool, allocator)
+	r.interpreter = interpreter
+}
+
+resolver_resolve_expr :: proc(
+	r: ^Resolver,
+	expr: Expr,
+	allocator := context.allocator,
+) -> (
+	err: Error,
+) {
+	switch e in expr {
+	case ^Expr_Variable:
+		if len(r.scopes) != 0 && r.scopes[len(r.scopes) - 1][e.name.lexeme] == false {
+			error(e.name, "Can't read local variable in it's own initializer.") or_return
+		}
+		resolver_resolve_local(r, e, e.name, allocator) or_return
+	case ^Expr_Assignment:
+		resolver_resolve_expr(r, e.value, allocator) or_return
+		resolver_resolve_local(r, e, e.name, allocator) or_return
+	case ^Expr_Binary:
+		resolver_resolve_expr(r, e.left, allocator) or_return
+		resolver_resolve_expr(r, e.right, allocator) or_return
+	case ^Expr_Call:
+		resolver_resolve_expr(r, e.callee, allocator) or_return
+		for arg in e.args {
+			resolver_resolve_expr(r, arg, allocator) or_return
+		}
+	case ^Expr_Grouping:
+		resolver_resolve_expr(r, e.expression, allocator) or_return
+	case ^Expr_Literal:
+		return nil
+	case ^Expr_Logical:
+		resolver_resolve_expr(r, e.left, allocator) or_return
+		resolver_resolve_expr(r, e.right, allocator) or_return
+	case ^Expr_Unary:
+		resolver_resolve_expr(r, e.right, allocator) or_return
+	}
+	return nil
+}
+
+resolver_resolve_local :: proc(
+	r: ^Resolver,
+	expr: Expr,
+	name: ^Token,
+	allocator := context.allocator,
+) -> (
+	err: Error,
+) {
+	for i := len(r.scopes) - 1; i >= 0; i -= 1 {
+		scope := r.scopes[i]
+		if _, has_key := scope[name.lexeme]; has_key {
+			interpreter_resolve(r.interpreter, expr, len(r.scopes) - 1 - i)
+			return
+		}
+	}
+	return nil
+}
+
+resolver_resolve_stmt :: proc(
+	r: ^Resolver,
+	stmt: Stmt,
+	allocator := context.allocator,
+) -> (
+	err: Error,
+) {
+	switch s in stmt {
+	case ^Stmt_Block:
+		resolver_scope_begin(r, allocator)
+		for st in s.statements {
+			resolver_resolve_stmt(r, st) or_return
+		}
+	case ^Stmt_Var:
+		resolver_declare(r, s.name)
+		if s.initializer != nil {
+			resolver_resolve_expr(r, s.initializer) or_return
+		}
+		resolver_define(r, s.name)
+	case ^Stmt_Function:
+		resolver_declare(r, s.name)
+		resolver_define(r, s.name)
+
+		resolver_resolve_function(r, s, .Function) or_return
+	case ^Stmt_Expr:
+		resolver_resolve_expr(r, s.expr) or_return
+	case ^Stmt_If:
+		resolver_resolve_expr(r, s.condition) or_return
+		resolver_resolve_stmt(r, s.branch_then) or_return
+		if s.branch_else != nil do resolver_resolve_stmt(r, s.branch_else) or_return
+	case ^Stmt_Print:
+		resolver_resolve_expr(r, s.expr) or_return
+	case ^Stmt_Return:
+		if r.current_function == .None {
+			error(s.keyword, "Can't return from top level code.") or_return
+		}
+
+		if s.value != nil {
+			resolver_resolve_expr(r, s.value) or_return
+		}
+	case ^Stmt_While:
+		resolver_resolve_expr(r, s.condition) or_return
+		resolver_resolve_stmt(r, s.body) or_return
+	}
+	return nil
+}
+
+resolver_resolve_stmts :: proc(
+	r: ^Resolver,
+	stmts: []Stmt,
+	allocator := context.allocator,
+) -> (
+	err: Error,
+) {
+	for stmt in stmts {
+		resolver_resolve_stmt(r, stmt, allocator) or_return
+	}
+	return nil
+}
+
+resolver_scope_begin :: proc(r: ^Resolver, allocator := context.allocator) {
+	new_scope := make(map[string]bool, allocator)
+	append(&r.scopes, new_scope)
+}
+resolver_scope_end :: proc(r: ^Resolver) {
+	last_scope := pop(&r.scopes)
+	delete(last_scope)
+}
+
+resolver_declare :: proc(r: ^Resolver, name: ^Token) {
+	if len(r.scopes) == 0 do return
+	scope := &r.scopes[len(r.scopes) - 1]
+	if _, in_scope := scope[name.lexeme]; in_scope {
+		error(name, "Already have a variable with this name in the scope.")
+	}
+	scope[name.lexeme] = false
+}
+resolver_define :: proc(r: ^Resolver, name: ^Token) {
+	if len(r.scopes) == 0 do return
+	scope := r.scopes[len(r.scopes) - 1]
+	scope[name.lexeme] = true
+}
+
+resolver_resolve_function :: proc(
+	r: ^Resolver,
+	fn: ^Stmt_Function,
+	fn_type: Resolver_Function_Type,
+) -> (
+	err: Error,
+) {
+	enclosing_fn := r.current_function
+	r.current_function = fn_type
+	defer r.current_function = enclosing_fn
+
+	resolver_scope_begin(r)
+	defer resolver_scope_end(r)
+
+	for param in fn.params {
+		resolver_declare(r, param)
+		resolver_define(r, param)
+	}
+
+	for stmt in fn.body {
+		resolver_resolve_stmt(r, stmt) or_return
+	}
+	return nil
+}
+
+interpreter_resolve :: proc(i: ^Interpreter, expr: Expr, depth: int) {
+	i.locals[expr] = depth
+}
+
+interpreter_look_up_variable :: proc(i: ^Interpreter, name: ^Token, expr: Expr) -> (Value, bool) {
+	distance, has_distance := i.locals[expr]
+
+	if has_distance {
+		return env_get_at(i.env, distance, name.lexeme)
+	} else {
+		return i.globals.values[name.lexeme]
+	}
+	return nil, false
+}
+
+env_get_at :: proc(env: ^Env, distance: int, name: string) -> (Value, bool) {
+	ancestor := env_ancestor(env, distance)
+	if ancestor == nil do return nil, false
+	return ancestor.values[name]
+}
+
+env_assign_at :: proc(env: ^Env, distance: int, name: string, value: Value) {
+	ancestor := env_ancestor(env, distance)
+	ancestor.values[name] = value
+}
+
+env_ancestor :: proc(env: ^Env, distance: int) -> ^Env {
+	e := env
+	for i := 0; i < distance; i += 1 {
+		if e == nil do return e
+		e = e.enclosing
+	}
+	return e
 }
