@@ -158,25 +158,30 @@ Token :: struct {
 }
 
 Function :: struct {
-	decl:    ^Stmt_Function,
-	closure: ^Env,
+	decl:           ^Stmt_Function,
+	closure:        ^Env,
+	is_initializer: bool,
+}
+
+Class :: struct {
+	name:    string,
+	methods: map[string]Function,
 }
 
 Value :: union {
 	string,
 	bool,
 	f64,
-	Object,
 	[dynamic]Value,
 	Function,
+	Class,
+	^Instance,
 }
 
-Object_Key :: union #no_nil {
-	string,
-	bool,
-	f64,
+Instance :: struct {
+	class:  Class,
+	fields: map[string]Value,
 }
-Object :: map[Object_Key]Value
 
 Token_Kind :: enum u8 {
 	Unknown,
@@ -413,11 +418,7 @@ scanner_identifier :: proc(s: ^Scanner) {
 	case "while":
 		type = .While
 	}
-	if type == .Identifier {
-		scanner_add_token_with_lexeme(s, type, text)
-	} else {
-		scanner_add_token(s, type)
-	}
+	scanner_add_token_with_lexeme(s, type, text)
 }
 
 scanner_add_simple_token :: proc(s: ^Scanner, kind: Token_Kind) {
@@ -481,12 +482,30 @@ Expr :: union {
 	^Expr_Assignment,
 	^Expr_Logical,
 	^Expr_Call,
+	^Expr_Get,
+	^Expr_Set,
+	^Expr_This,
 }
 
 Expr_Call :: struct {
 	callee: Expr,
 	paren:  ^Token,
 	args:   []Expr,
+}
+
+Expr_Get :: struct {
+	object: Expr,
+	name:   ^Token,
+}
+
+Expr_Set :: struct {
+	object: Expr,
+	name:   ^Token,
+	value:  Expr,
+}
+
+Expr_This :: struct {
+	keyword: ^Token,
 }
 
 Expr_Logical :: struct {
@@ -533,9 +552,14 @@ Error :: union {
 	Error_Variable_Undefined,
 	Error_Incorrect_Args_Amount,
 	Error_Return_Propagation,
+	Error_Property_Undefined,
 }
 
 Error_Variable_Undefined :: struct {
+	name: ^Token,
+}
+
+Error_Property_Undefined :: struct {
 	name: ^Token,
 }
 
@@ -580,16 +604,21 @@ parser_assignment :: proc(p: ^Parser, allocator := context.allocator) -> (e: Exp
 		equals := parser_prev(p)
 		val := parser_assignment(p, allocator) or_return
 
-		var, is_var := expr.(^Expr_Variable)
-		if is_var {
-			name := var.name
+		#partial switch e in expr {
+		case ^Expr_Variable:
 			assign := new(Expr_Assignment, allocator)
-			assign.name = name
+			assign.name = e.name
 			assign.value = val
 			return assign, nil
+		case ^Expr_Get:
+			set := new(Expr_Set, allocator)
+			set.object = e.object
+			set.name = e.name
+			set.value = val
+			return set, nil
+		case:
+			return nil, error(equals, "Invalid assignment target.")
 		}
-
-		return nil, error(equals, "Invalid assignment target.")
 	}
 
 	return expr, nil
@@ -741,6 +770,12 @@ parser_call :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, err
 	for {
 		if parser_match(p, {.Left_Paren}) {
 			expr = parser_finish_call(p, expr, allocator) or_return
+		} else if parser_match(p, {.Dot}) {
+			name := parser_consume(p, .Identifier, "Expect property name after '.'.") or_return
+			get := new(Expr_Get, allocator)
+			get.object = expr
+			get.name = name
+			expr = get
 		} else {
 			break
 		}
@@ -807,6 +842,12 @@ parser_primary :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, 
 		return expr, nil
 	}
 
+	if parser_match(p, {.This}) {
+		this := new(Expr_This, allocator)
+		this.keyword = parser_prev(p)
+		return this, nil
+	}
+
 	if parser_match(p, {.Identifier}) {
 		expr := new(Expr_Variable, allocator)
 		expr.name = parser_prev(p)
@@ -858,11 +899,11 @@ interpreter_expr_to_value :: proc(
 	err: Error,
 ) {
 	switch v in expr {
-	case (^Expr_Grouping):
+	case ^Expr_Grouping:
 		return interpreter_expr_to_value(i, v.expression, allocator)
-	case (^Expr_Literal):
+	case ^Expr_Literal:
 		return v.value, nil
-	case (^Expr_Unary):
+	case ^Expr_Unary:
 		right := interpreter_expr_to_value(i, v.right, allocator) or_return
 
 		#partial switch v.operator.kind {
@@ -873,7 +914,7 @@ interpreter_expr_to_value :: proc(
 			return !value_is_truthy(right), nil
 		}
 		return nil, nil // unreachebale
-	case (^Expr_Binary):
+	case ^Expr_Binary:
 		left := interpreter_expr_to_value(i, v.left, allocator) or_return
 		right := interpreter_expr_to_value(i, v.right, allocator) or_return
 		#partial switch v.operator.kind {
@@ -919,13 +960,13 @@ interpreter_expr_to_value :: proc(
 		case .Equal_Equal:
 			return values_are_equal(left, right), nil
 		}
-	case (^Expr_Variable):
-		val, ok := env_get(i.env, v.name.lexeme)
+	case ^Expr_Variable:
+		val, ok := interpreter_look_up_variable(i, v.name, v)
 		if !ok {
 			return nil, Error_Variable_Undefined{name = v.name}
 		}
 		return val, nil
-	case (^Expr_Assignment):
+	case ^Expr_Assignment:
 		val := interpreter_expr_to_value(i, v.value, allocator) or_return
 		distance, has_distance := i.locals[v]
 
@@ -935,7 +976,7 @@ interpreter_expr_to_value :: proc(
 			env_assign(i.globals, v.name, val) or_return
 		}
 		return val, nil
-	case (^Expr_Logical):
+	case ^Expr_Logical:
 		left := interpreter_expr_to_value(i, v.left, allocator) or_return
 
 		is_truthy := value_is_truthy(left)
@@ -946,33 +987,92 @@ interpreter_expr_to_value :: proc(
 		}
 
 		return interpreter_expr_to_value(i, v.right, allocator)
-	case (^Expr_Call):
+	case ^Expr_Call:
 		callee := interpreter_expr_to_value(i, v.callee, allocator) or_return
-		fn, is_fn := callee.(Function)
-		if !is_fn {
+		#partial switch &c in callee {
+		case Function:
+			args := make([dynamic]Value)
+			defer {
+				delete(args)
+			}
+
+			for arg in v.args {
+				val := interpreter_expr_to_value(i, arg, allocator) or_return
+				append(&args, val)
+			}
+
+			if len(c.decl.params) != len(args) {
+				return nil, Error_Incorrect_Args_Amount {
+					fn = v.paren,
+					expected = len(c.decl.params),
+					received = len(args),
+				}
+			}
+			return c.decl.call(i, &c, args[:], allocator)
+		case Class:
+			args := make([dynamic]Value)
+			defer {
+				delete(args)
+			}
+
+			for arg in v.args {
+				val := interpreter_expr_to_value(i, arg, allocator) or_return
+				append(&args, val)
+			}
+			if len(args) != 0 {
+				return nil, Error_Incorrect_Args_Amount {
+					fn = v.paren,
+					expected = 0,
+					received = len(args),
+				}
+			}
+			instance := new(Instance, allocator)
+			instance.class = c
+			instance.fields = make(map[string]Value, allocator)
+
+			init, has_init := c.methods["init"]
+			if has_init {
+				fn := function_bind(&init, instance, allocator)
+				if len(fn.decl.params) != len(args) {
+					return nil, Error_Incorrect_Args_Amount {
+						fn = v.paren,
+						expected = len(fn.decl.params),
+						received = len(args),
+					}
+				}
+				interpreter_function_call(i, &fn, args[:], allocator)
+			}
+			return instance, nil
+		case:
 			return nil, Error_Unexpected_Token {
 				token = v.paren,
 				message = "Can only call functions and classes",
 			}
 		}
-		args := make([dynamic]Value)
-		defer {
-			delete(args)
+	case ^Expr_Get:
+		obj := interpreter_expr_to_value(i, v.object, allocator) or_return
+		if instance, is_instance := obj.(^Instance); is_instance {
+			return instance_get(instance, v.name, allocator)
 		}
 
-		for arg in v.args {
-			val := interpreter_expr_to_value(i, arg, allocator) or_return
-			append(&args, val)
-		}
+		return nil, Error_Unexpected_Token{v.name, "Only instances have properties."}
+	case ^Expr_Set:
+		object := interpreter_expr_to_value(i, v.object, allocator) or_return
 
-		if len(fn.decl.params) != len(args) {
-			return nil, Error_Incorrect_Args_Amount {
-				fn = v.paren,
-				expected = len(fn.decl.params),
-				received = len(args),
-			}
+		#partial switch &obj in object {
+		case ^Instance:
+			val := interpreter_expr_to_value(i, v.value, allocator) or_return
+			instance_set(obj, v.name, val)
+			return val, nil
+		case:
+			return nil, Error_Unexpected_Token{v.name, "Only instances have fields."}
 		}
-		return fn.decl.call(i, &fn, args[:], allocator)
+	case ^Expr_This:
+		val, ok := interpreter_look_up_variable(i, v.keyword, v)
+		if !ok {
+			return nil, Error_Variable_Undefined{name = v.keyword}
+		}
+		return val, nil
 	}
 	return nil, nil
 }
@@ -998,9 +1098,6 @@ values_are_equal :: proc(left, right: Value) -> bool {
 	case f64:
 		r := right.(f64) or_return
 		return l == r
-	case Object:
-		r := right.(Object) or_return
-		return (transmute(runtime.Raw_Map)l).data == (transmute(runtime.Raw_Map)r).data
 	case [dynamic]Value:
 		r := right.([dynamic]Value) or_return
 		return(
@@ -1009,10 +1106,16 @@ values_are_equal :: proc(left, right: Value) -> bool {
 					(transmute(runtime.Raw_Dynamic_Array)r).data) \
 		)
 	case Function:
-		return false
+		r := right.(Function) or_return
+		return l.decl == r.decl
+	case Class:
+		r := right.(Class) or_return
+		return r.name == l.name
+	case ^Instance:
+		r := right.(^Instance) or_return
+		return r == l
 	case nil:
-		if right == nil do return true
-		return false
+		return right == nil
 	}
 	return false
 }
@@ -1059,6 +1162,8 @@ runtime_error :: proc(err: Error) {
 			v.expected,
 			v.received,
 		)
+	case Error_Property_Undefined:
+		fmt.eprintfln("Undefined property \"%s\".", v.name.lexeme)
 	case Error_Return_Propagation: // should never happen as it is return mechanism
 	}
 	had_runtime_error = true
@@ -1073,6 +1178,7 @@ Stmt :: union {
 	^Stmt_While,
 	^Stmt_Function,
 	^Stmt_Return,
+	^Stmt_Class,
 }
 
 Stmt_While :: struct {
@@ -1101,6 +1207,11 @@ Stmt_If :: struct {
 	condition:   Expr,
 	branch_then: Stmt,
 	branch_else: Stmt,
+}
+
+Stmt_Class :: struct {
+	name:    ^Token,
+	methods: []^Stmt_Function,
 }
 
 Stmt_Function :: struct {
@@ -1271,8 +1382,16 @@ parser_stmt_if :: proc(p: ^Parser, allocator := context.allocator) -> (stmt: Stm
 }
 
 parser_decl :: proc(p: ^Parser, allocator := context.allocator) -> Stmt {
+	if parser_match(p, {.Class}) {
+		class, class_err := parser_stmt_class(p, allocator)
+		if class_err != nil {
+			parser_sync(p)
+			return nil
+		}
+		return class
+	}
 	if parser_match(p, {.Fun}) {
-		fn, err := parser_stmt_function(p, allocator)
+		fn, err := parser_stmt_function(p, false, allocator)
 		if err != nil {
 			parser_sync(p)
 			return nil
@@ -1297,8 +1416,8 @@ parser_decl :: proc(p: ^Parser, allocator := context.allocator) -> Stmt {
 
 parser_stmt_function :: proc(
 	p: ^Parser,
-	allocator := context.allocator,
 	is_method := false,
+	allocator := context.allocator,
 ) -> (
 	stmt: ^Stmt_Function,
 	err: Error,
@@ -1360,6 +1479,34 @@ parser_stmt_var_decl :: proc(
 	decl.name = name
 	decl.initializer = init
 	return decl, nil
+}
+
+parser_stmt_class :: proc(
+	p: ^Parser,
+	allocator := context.allocator,
+) -> (
+	stmt: ^Stmt_Class,
+	err: Error,
+) {
+	name := parser_consume(p, .Identifier, "Expect class name.") or_return
+	parser_consume(p, .Left_Brace, "Expect '{' before class body.") or_return
+
+	methods := make([dynamic]^Stmt_Function, allocator)
+	defer if err != nil {
+		delete(methods)
+	}
+
+	for !parser_check(p, .Right_Brace) && !parser_is_eof(p) {
+		fn := parser_stmt_function(p, true, allocator) or_return
+		append(&methods, fn)
+	}
+
+	parser_consume(p, .Right_Brace, "Expect '}' after class body.") or_return
+
+	class := new(Stmt_Class, allocator)
+	class.methods = methods[:]
+	class.name = name
+	return class, nil
 }
 
 parser_stmt_print :: proc(p: ^Parser, allocator := context.allocator) -> (s: Stmt, err: Error) {
@@ -1454,8 +1601,25 @@ interpreter_stmt_execute :: proc(
 		if v.value != nil {
 			val = interpreter_expr_to_value(i, v.value, allocator) or_return
 		}
-
 		return Error_Return_Propagation{val}
+	case ^Stmt_Class:
+		env_define(i.env, v.name.lexeme, nil)
+
+		methods := make(map[string]Function, allocator)
+		for method in v.methods {
+			fn := Function {
+				decl           = method,
+				closure        = i.env,
+				is_initializer = method.name.lexeme == "init",
+			}
+			methods[method.name.lexeme] = fn
+		}
+
+		class := Class {
+			name    = v.name.lexeme,
+			methods = methods,
+		}
+		env_assign(i.env, v.name, class)
 	}
 	return nil
 }
@@ -1499,7 +1663,7 @@ value_to_string :: proc(val: Value, allocator := context.allocator) -> string {
 	switch v in val {
 	case string:
 		return v
-	case nil, f64, bool, Object, [dynamic]Value:
+	case nil, f64, bool, [dynamic]Value:
 		return fmt.aprintf("%#v", v, allocator = allocator)
 	case Function:
 		if v.decl.call == interpreter_function_call {
@@ -1507,6 +1671,10 @@ value_to_string :: proc(val: Value, allocator := context.allocator) -> string {
 		} else {
 			return fmt.aprintf("<native fn %s>", v.decl.name.lexeme)
 		}
+	case Class:
+		return v.name
+	case ^Instance:
+		return fmt.aprintf("%s instance", v.class.name)
 	}
 	return ""
 }
@@ -1521,7 +1689,6 @@ interpreter_function_call :: proc(
 	Error,
 ) {
 	fn_env := new(Env, allocator)
-	defer free(fn_env)
 	fn_env.enclosing = fn.closure
 
 	for i in 0 ..< len(args) {
@@ -1530,7 +1697,16 @@ interpreter_function_call :: proc(
 	possible_err := interpreter_execute_block(i, fn.decl.body, fn_env, allocator)
 	result, is_result := possible_err.(Error_Return_Propagation)
 	if is_result {
+		if fn.is_initializer {
+			this, _ := env_get_at(fn.closure, 0, "this")
+			return this, nil
+		}
 		return result.val, nil
+	}
+
+	if fn.is_initializer {
+		this, _ := env_get_at(fn.closure, 0, "this")
+		return this, nil
 	}
 	return nil, possible_err
 }
@@ -1539,11 +1715,19 @@ Resolver :: struct {
 	scopes:           [dynamic]map[string]bool,
 	interpreter:      ^Interpreter,
 	current_function: Resolver_Function_Type,
+	current_class:    Resolver_Class_Type,
 }
 
 Resolver_Function_Type :: enum u8 {
 	None,
 	Function,
+	Method,
+	Initializer,
+}
+
+Resolver_Class_Type :: enum u8 {
+	None,
+	Class,
 }
 
 resolver_init :: proc(
@@ -1565,7 +1749,7 @@ resolver_resolve_expr :: proc(
 	switch e in expr {
 	case ^Expr_Variable:
 		if len(r.scopes) != 0 && r.scopes[len(r.scopes) - 1][e.name.lexeme] == false {
-			error(e.name, "Can't read local variable in it's own initializer.") or_return
+			return error(e.name, "Can't read local variable in it's own initializer.")
 		}
 		resolver_resolve_local(r, e, e.name, allocator) or_return
 	case ^Expr_Assignment:
@@ -1588,6 +1772,17 @@ resolver_resolve_expr :: proc(
 		resolver_resolve_expr(r, e.right, allocator) or_return
 	case ^Expr_Unary:
 		resolver_resolve_expr(r, e.right, allocator) or_return
+	case ^Expr_Get:
+		resolver_resolve_expr(r, e.object, allocator) or_return
+	case ^Expr_Set:
+		resolver_resolve_expr(r, e.value, allocator) or_return
+		resolver_resolve_expr(r, e.object, allocator) or_return
+	case ^Expr_This:
+		if r.current_class == .None {
+			error(e.keyword, "Can't use 'this' outside of a class.")
+			return nil
+		}
+		resolver_resolve_local(r, e, e.keyword, allocator) or_return
 	}
 	return nil
 }
@@ -1604,7 +1799,7 @@ resolver_resolve_local :: proc(
 		scope := r.scopes[i]
 		if _, has_key := scope[name.lexeme]; has_key {
 			interpreter_resolve(r.interpreter, expr, len(r.scopes) - 1 - i)
-			return
+			return nil
 		}
 	}
 	return nil
@@ -1633,7 +1828,7 @@ resolver_resolve_stmt :: proc(
 		resolver_declare(r, s.name)
 		resolver_define(r, s.name)
 
-		resolver_resolve_function(r, s, .Function) or_return
+		resolver_resolve_function(r, s, .Function, allocator) or_return
 	case ^Stmt_Expr:
 		resolver_resolve_expr(r, s.expr) or_return
 	case ^Stmt_If:
@@ -1644,15 +1839,37 @@ resolver_resolve_stmt :: proc(
 		resolver_resolve_expr(r, s.expr) or_return
 	case ^Stmt_Return:
 		if r.current_function == .None {
-			error(s.keyword, "Can't return from top level code.") or_return
+			error(s.keyword, "Can't return from top level code.")
 		}
 
 		if s.value != nil {
+			if r.current_function == .Initializer {
+				error(s.keyword, "Can't return a value from an initializer")
+			}
 			resolver_resolve_expr(r, s.value) or_return
 		}
 	case ^Stmt_While:
 		resolver_resolve_expr(r, s.condition) or_return
 		resolver_resolve_stmt(r, s.body) or_return
+	case ^Stmt_Class:
+		enclosing_class := r.current_class
+		r.current_class = .Class
+		defer r.current_class = enclosing_class
+
+		resolver_declare(r, s.name)
+		resolver_define(r, s.name)
+
+		resolver_scope_begin(r, allocator)
+		r.scopes[len(r.scopes) - 1]["this"] = true
+		defer resolver_scope_end(r)
+
+		for method in s.methods {
+			fn_type := Resolver_Function_Type.Method
+			if method.name.lexeme == "init" {
+				fn_type = .Initializer
+			}
+			resolver_resolve_function(r, method, fn_type, allocator) or_return
+		}
 	}
 	return nil
 }
@@ -1697,6 +1914,7 @@ resolver_resolve_function :: proc(
 	r: ^Resolver,
 	fn: ^Stmt_Function,
 	fn_type: Resolver_Function_Type,
+	allocator := context.allocator,
 ) -> (
 	err: Error,
 ) {
@@ -1704,7 +1922,7 @@ resolver_resolve_function :: proc(
 	r.current_function = fn_type
 	defer r.current_function = enclosing_fn
 
-	resolver_scope_begin(r)
+	resolver_scope_begin(r, allocator)
 	defer resolver_scope_end(r)
 
 	for param in fn.params {
@@ -1713,7 +1931,7 @@ resolver_resolve_function :: proc(
 	}
 
 	for stmt in fn.body {
-		resolver_resolve_stmt(r, stmt) or_return
+		resolver_resolve_stmt(r, stmt, allocator) or_return
 	}
 	return nil
 }
@@ -1751,4 +1969,34 @@ env_ancestor :: proc(env: ^Env, distance: int) -> ^Env {
 		e = e.enclosing
 	}
 	return e
+}
+
+instance_get :: proc(
+	i: ^Instance,
+	name: ^Token,
+	allocator := context.allocator,
+) -> (
+	Value,
+	Error,
+) {
+	property, has_property := i.fields[name.lexeme]
+	if has_property {
+		return property, nil
+	}
+	method, has_method := i.class.methods[name.lexeme]
+	if has_method {
+		return function_bind(&method, i, allocator), nil
+	}
+	return nil, Error_Property_Undefined{name}
+}
+
+instance_set :: proc(i: ^Instance, name: ^Token, val: Value) {
+	i.fields[name.lexeme] = val
+}
+
+function_bind :: proc(fn: ^Function, i: ^Instance, allocator := context.allocator) -> Function {
+	new_env := new(Env, allocator)
+	new_env.enclosing = fn.closure
+	env_define(new_env, "this", i)
+	return {closure = new_env, decl = fn.decl, is_initializer = fn.is_initializer}
 }
