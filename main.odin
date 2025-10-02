@@ -164,8 +164,9 @@ Function :: struct {
 }
 
 Class :: struct {
-	name:    string,
-	methods: map[string]Function,
+	name:       string,
+	superclass: ^Class,
+	methods:    map[string]Function,
 }
 
 Value :: union {
@@ -174,12 +175,12 @@ Value :: union {
 	f64,
 	[dynamic]Value,
 	Function,
-	Class,
+	^Class,
 	^Instance,
 }
 
 Instance :: struct {
-	class:  Class,
+	class:  ^Class,
 	fields: map[string]Value,
 }
 
@@ -485,6 +486,7 @@ Expr :: union {
 	^Expr_Get,
 	^Expr_Set,
 	^Expr_This,
+	^Expr_Super,
 }
 
 Expr_Call :: struct {
@@ -502,6 +504,11 @@ Expr_Set :: struct {
 	object: Expr,
 	name:   ^Token,
 	value:  Expr,
+}
+
+Expr_Super :: struct {
+	keyword: ^Token,
+	method:  ^Token,
 }
 
 Expr_This :: struct {
@@ -842,6 +849,16 @@ parser_primary :: proc(p: ^Parser, allocator := context.allocator) -> (e: Expr, 
 		return expr, nil
 	}
 
+	if parser_match(p, {.Super}) {
+		keyword := parser_prev(p)
+		parser_consume(p, .Dot, "Expect '.' after 'super'.") or_return
+		method := parser_consume(p, .Identifier, "") or_return
+		super := new(Expr_Super, allocator)
+		super.keyword = keyword
+		super.method = method
+		return super, nil
+	}
+
 	if parser_match(p, {.This}) {
 		this := new(Expr_This, allocator)
 		this.keyword = parser_prev(p)
@@ -1009,7 +1026,7 @@ interpreter_expr_to_value :: proc(
 				}
 			}
 			return c.decl.call(i, &c, args[:], allocator)
-		case Class:
+		case ^Class:
 			args := make([dynamic]Value)
 			defer {
 				delete(args)
@@ -1030,9 +1047,9 @@ interpreter_expr_to_value :: proc(
 			instance.class = c
 			instance.fields = make(map[string]Value, allocator)
 
-			init, has_init := c.methods["init"]
+			init, has_init := class_find_method(c, "init")
 			if has_init {
-				fn := function_bind(&init, instance, allocator)
+				fn := function_bind(init, instance, allocator)
 				if len(fn.decl.params) != len(args) {
 					return nil, Error_Incorrect_Args_Amount {
 						fn = v.paren,
@@ -1073,6 +1090,15 @@ interpreter_expr_to_value :: proc(
 			return nil, Error_Variable_Undefined{name = v.keyword}
 		}
 		return val, nil
+	case ^Expr_Super:
+		distance := i.locals[v]
+		superclass := env_get_at(i.env, distance, "super").(^Class)
+		object := env_get_at(i.env, distance - 1, "this").(^Instance)
+		method, has_method := class_find_method(superclass, v.method.lexeme)
+		if !has_method {
+			return nil, Error_Property_Undefined{name = v.method}
+		}
+		return function_bind(method, object), nil
 	}
 	return nil, nil
 }
@@ -1108,8 +1134,8 @@ values_are_equal :: proc(left, right: Value) -> bool {
 	case Function:
 		r := right.(Function) or_return
 		return l.decl == r.decl
-	case Class:
-		r := right.(Class) or_return
+	case ^Class:
+		r := right.(^Class) or_return
 		return r.name == l.name
 	case ^Instance:
 		r := right.(^Instance) or_return
@@ -1210,8 +1236,9 @@ Stmt_If :: struct {
 }
 
 Stmt_Class :: struct {
-	name:    ^Token,
-	methods: []^Stmt_Function,
+	name:       ^Token,
+	superclass: ^Expr_Variable,
+	methods:    []^Stmt_Function,
 }
 
 Stmt_Function :: struct {
@@ -1489,6 +1516,14 @@ parser_stmt_class :: proc(
 	err: Error,
 ) {
 	name := parser_consume(p, .Identifier, "Expect class name.") or_return
+
+	superclass: ^Expr_Variable
+	if parser_match(p, {.Less}) {
+		parser_consume(p, .Identifier, "Expect superclass name.")
+		superclass = new(Expr_Variable, allocator)
+		superclass.name = parser_prev(p)
+	}
+
 	parser_consume(p, .Left_Brace, "Expect '{' before class body.") or_return
 
 	methods := make([dynamic]^Stmt_Function, allocator)
@@ -1506,6 +1541,7 @@ parser_stmt_class :: proc(
 	class := new(Stmt_Class, allocator)
 	class.methods = methods[:]
 	class.name = name
+	class.superclass = superclass
 	return class, nil
 }
 
@@ -1603,7 +1639,24 @@ interpreter_stmt_execute :: proc(
 		}
 		return Error_Return_Propagation{val}
 	case ^Stmt_Class:
+		superclass: ^Class
+		if v.superclass != nil {
+			val := interpreter_expr_to_value(i, v.superclass, allocator) or_return
+			is_class: bool
+			superclass, is_class = val.(^Class)
+			if !is_class {
+				return Error_Unexpected_Token{v.superclass.name, "Superclass must be a class"}
+			}
+		}
+
 		env_define(i.env, v.name.lexeme, nil)
+
+		if v.superclass != nil {
+			new_env := new(Env, allocator)
+			new_env.enclosing = i.env
+			i.env = new_env
+			env_define(i.env, "super", superclass)
+		}
 
 		methods := make(map[string]Function, allocator)
 		for method in v.methods {
@@ -1615,10 +1668,15 @@ interpreter_stmt_execute :: proc(
 			methods[method.name.lexeme] = fn
 		}
 
-		class := Class {
-			name    = v.name.lexeme,
-			methods = methods,
+		class := new(Class, allocator)
+		class.name = v.name.lexeme
+		class.methods = methods
+		class.superclass = superclass
+
+		if superclass != nil {
+			i.env = i.env.enclosing
 		}
+
 		env_assign(i.env, v.name, class)
 	}
 	return nil
@@ -1671,7 +1729,7 @@ value_to_string :: proc(val: Value, allocator := context.allocator) -> string {
 		} else {
 			return fmt.aprintf("<native fn %s>", v.decl.name.lexeme)
 		}
-	case Class:
+	case ^Class:
 		return v.name
 	case ^Instance:
 		return fmt.aprintf("%s instance", v.class.name)
@@ -1728,6 +1786,7 @@ Resolver_Function_Type :: enum u8 {
 Resolver_Class_Type :: enum u8 {
 	None,
 	Class,
+	Subclass,
 }
 
 resolver_init :: proc(
@@ -1783,6 +1842,13 @@ resolver_resolve_expr :: proc(
 			return nil
 		}
 		resolver_resolve_local(r, e, e.keyword, allocator) or_return
+	case ^Expr_Super:
+		if r.current_class == .None {
+			error(e.keyword, "Can't use 'super' outside of class.")
+		} else if r.current_class != .Subclass {
+			error(e.keyword, "Can't use 'super' in a class with no superclass.")
+		}
+		resolver_resolve_local(r, e, e.keyword, allocator) or_return
 	}
 	return nil
 }
@@ -1816,12 +1882,12 @@ resolver_resolve_stmt :: proc(
 	case ^Stmt_Block:
 		resolver_scope_begin(r, allocator)
 		for st in s.statements {
-			resolver_resolve_stmt(r, st) or_return
+			resolver_resolve_stmt(r, st, allocator) or_return
 		}
 	case ^Stmt_Var:
 		resolver_declare(r, s.name)
 		if s.initializer != nil {
-			resolver_resolve_expr(r, s.initializer) or_return
+			resolver_resolve_expr(r, s.initializer, allocator) or_return
 		}
 		resolver_define(r, s.name)
 	case ^Stmt_Function:
@@ -1830,13 +1896,13 @@ resolver_resolve_stmt :: proc(
 
 		resolver_resolve_function(r, s, .Function, allocator) or_return
 	case ^Stmt_Expr:
-		resolver_resolve_expr(r, s.expr) or_return
+		resolver_resolve_expr(r, s.expr, allocator) or_return
 	case ^Stmt_If:
-		resolver_resolve_expr(r, s.condition) or_return
-		resolver_resolve_stmt(r, s.branch_then) or_return
-		if s.branch_else != nil do resolver_resolve_stmt(r, s.branch_else) or_return
+		resolver_resolve_expr(r, s.condition, allocator) or_return
+		resolver_resolve_stmt(r, s.branch_then, allocator) or_return
+		if s.branch_else != nil do resolver_resolve_stmt(r, s.branch_else, allocator) or_return
 	case ^Stmt_Print:
-		resolver_resolve_expr(r, s.expr) or_return
+		resolver_resolve_expr(r, s.expr, allocator) or_return
 	case ^Stmt_Return:
 		if r.current_function == .None {
 			error(s.keyword, "Can't return from top level code.")
@@ -1846,11 +1912,11 @@ resolver_resolve_stmt :: proc(
 			if r.current_function == .Initializer {
 				error(s.keyword, "Can't return a value from an initializer")
 			}
-			resolver_resolve_expr(r, s.value) or_return
+			resolver_resolve_expr(r, s.value, allocator) or_return
 		}
 	case ^Stmt_While:
-		resolver_resolve_expr(r, s.condition) or_return
-		resolver_resolve_stmt(r, s.body) or_return
+		resolver_resolve_expr(r, s.condition, allocator) or_return
+		resolver_resolve_stmt(r, s.body, allocator) or_return
 	case ^Stmt_Class:
 		enclosing_class := r.current_class
 		r.current_class = .Class
@@ -1859,9 +1925,24 @@ resolver_resolve_stmt :: proc(
 		resolver_declare(r, s.name)
 		resolver_define(r, s.name)
 
+		if s.superclass != nil {
+			if s.superclass.name.lexeme == s.name.lexeme {
+				error(s.superclass.name, "A class can't inherit from itself")
+			}
+			r.current_class = .Subclass
+			resolver_resolve_expr(r, s.superclass, allocator) or_return
+			resolver_scope_begin(r, allocator)
+			r.scopes[len(r.scopes) - 1]["super"] = true
+		}
+
 		resolver_scope_begin(r, allocator)
 		r.scopes[len(r.scopes) - 1]["this"] = true
-		defer resolver_scope_end(r)
+		defer {
+			resolver_scope_end(r)
+			if s.superclass != nil {
+				resolver_scope_end(r)
+			}
+		}
 
 		for method in s.methods {
 			fn_type := Resolver_Function_Type.Method
@@ -1951,7 +2032,7 @@ interpreter_look_up_variable :: proc(i: ^Interpreter, name: ^Token, expr: Expr) 
 	return nil, false
 }
 
-env_get_at :: proc(env: ^Env, distance: int, name: string) -> (Value, bool) {
+env_get_at :: proc(env: ^Env, distance: int, name: string) -> (Value, bool) #optional_ok {
 	ancestor := env_ancestor(env, distance)
 	if ancestor == nil do return nil, false
 	return ancestor.values[name]
@@ -1983,15 +2064,28 @@ instance_get :: proc(
 	if has_property {
 		return property, nil
 	}
-	method, has_method := i.class.methods[name.lexeme]
+	method, has_method := class_find_method(i.class, name.lexeme)
 	if has_method {
-		return function_bind(&method, i, allocator), nil
+		return function_bind(method, i, allocator), nil
 	}
 	return nil, Error_Property_Undefined{name}
 }
 
 instance_set :: proc(i: ^Instance, name: ^Token, val: Value) {
 	i.fields[name.lexeme] = val
+}
+
+class_find_method :: proc(class: ^Class, method: string) -> (^Function, bool) #optional_ok {
+	fn, has_fn := &class.methods[method]
+	if has_fn {
+		return fn, true
+	}
+
+	if class.superclass != nil {
+		return class_find_method(class.superclass, method)
+	}
+
+	return nil, false
 }
 
 function_bind :: proc(fn: ^Function, i: ^Instance, allocator := context.allocator) -> Function {
