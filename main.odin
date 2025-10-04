@@ -103,28 +103,30 @@ run_code :: proc(code: string) {
 		env     = &global_env,
 		locals  = make(map[Expr]int),
 	}
-	env_define(
-		interpreter.globals,
-		"clock",
-		Function {
-			decl = &Stmt_Function {
-				name = &Token{lexeme = "clock", kind = .Identifier},
-				call = proc(
-					i: ^Interpreter,
-					fn: ^Function,
-					args: []Value,
-					allocator: runtime.Allocator,
-				) -> (
-					Value,
-					Error,
-				) {
-					return f64(time.tick_now()._nsec / 1_000_000_000), nil
-				},
+	clock_fn := Function {
+		decl = &Stmt_Function {
+			name = &Token{lexeme = "clock", kind = .Identifier},
+			call = proc(
+				i: ^Interpreter,
+				fn: ^Function,
+				args: []Value,
+				allocator: runtime.Allocator,
+			) -> (
+				Value,
+				Error,
+			) {
+				return f64(time.tick_now()._nsec / 1_000_000_000), nil
 			},
 		},
-	)
+	}
+	env_define(interpreter.globals, "clock", clock_fn)
+
 	resolver := Resolver{}
 	resolver_init(&resolver, &interpreter)
+
+	resolver_declare(&resolver, clock_fn.decl.name)
+	resolver_define(&resolver, clock_fn.decl.name)
+
 	resolver_resolve_stmts(&resolver, stmts[:])
 	if had_error {
 		return
@@ -1807,8 +1809,11 @@ resolver_resolve_expr :: proc(
 ) {
 	switch e in expr {
 	case ^Expr_Variable:
-		if len(r.scopes) != 0 && r.scopes[len(r.scopes) - 1][e.name.lexeme] == false {
-			return error(e.name, "Can't read local variable in it's own initializer.")
+		if len(r.scopes) != 0 {
+			resolved, declared := r.scopes[len(r.scopes) - 1][e.name.lexeme]
+			if !resolved && declared {
+				error(e.name, "Can't read local variable in it's own initializer.")
+			}
 		}
 		resolver_resolve_local(r, e, e.name, allocator) or_return
 	case ^Expr_Assignment:
@@ -1884,6 +1889,7 @@ resolver_resolve_stmt :: proc(
 		for st in s.statements {
 			resolver_resolve_stmt(r, st, allocator) or_return
 		}
+		resolver_scope_end(r)
 	case ^Stmt_Var:
 		resolver_declare(r, s.name)
 		if s.initializer != nil {
