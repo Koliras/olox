@@ -2,6 +2,11 @@ package lox
 
 Op_Code :: enum u8 {
 	Constant,
+	Add,
+	Substract,
+	Multiply,
+	Devide,
+	Negate,
 	Return,
 }
 
