@@ -3,6 +3,8 @@ package lox
 import "base:runtime"
 import "core:fmt"
 import "core:mem"
+import os_old "core:os"
+import os "core:os/os2"
 
 STACK_MAX :: 256
 
@@ -23,6 +25,61 @@ vm_reset_stack :: proc(vm: ^VM) {
 
 vm_free :: proc(vm: ^VM) {}
 
+vm_repl :: proc(vm: ^VM) {
+	line: [1024]byte
+
+	for {
+		fmt.print("> ")
+
+		if read_amount, read_err := os.read(os.stdin, line[:]); read_err != nil {
+			fmt.print("\n")
+			break
+		}
+
+		vm_interpret(vm, line[:])
+	}
+}
+
+vm_run_file :: proc(vm: ^VM, fp: string, allocator := context.allocator) {
+	source, _ := _read_file(fp, allocator)
+	defer delete(source, allocator)
+	result := vm_interpret(vm, source)
+
+	if result == .Compile_Error {
+		os.exit(65)
+	} else if result == .Runtime_Error {
+		os.exit(70)
+	}
+}
+
+_read_file :: proc(path: string, allocator := context.allocator) -> (data: []byte, err: os.Error) {
+	file, file_err := os.open(path)
+	if file_err != nil {
+		fmt.fprintfln(os_old.stderr, "Could not open file \"%s\".", path)
+		os.exit(74)
+	}
+
+	defer os.close(file)
+
+	file_size := os.file_size(file) or_return
+	allocation_err: runtime.Allocator_Error
+	data, allocation_err = make([]byte, file_size + 1, allocator)
+	if allocation_err != nil {
+		fmt.fprintfln(os_old.stderr, "Not enough memory to read \"%s\".", path)
+		os.exit(74)
+	}
+
+	bytes_read, _ := os.read(file, data[:])
+	if i64(bytes_read) < file_size {
+		fmt.fprintfln(os_old.stderr, "Could not read file \"%s\".", path)
+		os.exit(74)
+	}
+
+	data[bytes_read] = 0
+
+	return data, nil
+}
+
 vm_push :: proc(vm: ^VM, val: Value) {
 	vm.stack_top^ = val
 	vm.stack_top = mem.ptr_offset(vm.stack_top, 1)
@@ -38,10 +95,9 @@ Interpret_Error :: enum {
 	Compile_Error,
 	Runtime_Error,
 }
-vm_interpret :: proc(vm: ^VM, chunk: ^Chunk) -> Interpret_Error {
-	vm.chunk = chunk
-	vm.ip = chunk.code
-	return vm_run(vm)
+vm_interpret :: proc(vm: ^VM, source: []byte) -> Interpret_Error {
+	compile(source)
+	return .None
 }
 
 vm_run :: proc(vm: ^VM) -> Interpret_Error {
