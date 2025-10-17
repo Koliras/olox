@@ -79,9 +79,6 @@ scanner_is_at_end :: proc(s: ^Scanner) -> bool {
 scanner_peek :: proc(s: ^Scanner) -> byte {
 	return s.current[0]
 }
-scanner_start_byte :: proc(s: ^Scanner, start: rawptr) -> byte {
-	return s.start^
-}
 
 scanner_peek_next :: proc(s: ^Scanner) -> byte {
 	if scanner_is_at_end(s) do return 0
@@ -250,7 +247,7 @@ scanner_identifier_type :: proc(s: ^Scanner) -> Token_Type {
 		return scanner_check_keyword(s, 1, 3, "lse", .Else)
 	case 'f':
 		if int(uintptr(s.current) - uintptr(s.start)) > 1 {
-			next := scanner_start_byte(s, &(cast([^]byte)s.start)[1])
+			next := (cast([^]byte)s.start)[1]
 			switch next {
 			case 'a':
 				return scanner_check_keyword(s, 2, 3, "lse", .False)
@@ -274,7 +271,7 @@ scanner_identifier_type :: proc(s: ^Scanner) -> Token_Type {
 		return scanner_check_keyword(s, 1, 4, "uper", .Super)
 	case 't':
 		if int(uintptr(s.current) - uintptr(s.start)) > 1 {
-			next := scanner_start_byte(s, &(cast([^]byte)s.start)[1])
+			next := (cast([^]byte)s.start)[1]
 			switch next {
 			case 'h':
 				return scanner_check_keyword(s, 2, 2, "is", .This)
@@ -298,7 +295,7 @@ scanner_check_keyword :: proc(
 	type: Token_Type,
 ) -> Token_Type {
 	if int(uintptr(s.current) - uintptr(s.start)) == start + length &&
-	   mem.compare((cast([^]byte)s.start)[start:length], transmute([]byte)rest) == 0 {
+	   mem.compare((cast([^]byte)s.start)[start:start + length], transmute([]byte)rest) == 0 {
 		return type
 	}
 	return .Identifier
