@@ -96,8 +96,17 @@ Interpret_Error :: enum {
 	Runtime_Error,
 }
 vm_interpret :: proc(vm: ^VM, source: []byte) -> Interpret_Error {
-	compile(source)
-	return .None
+	chunk: Chunk
+	defer chunk_free(&chunk)
+	if !compile(source, &chunk) {
+		return .Compile_Error
+	}
+
+	vm.chunk = &chunk
+	vm.ip = chunk.code
+
+	result := vm_run(vm)
+	return result
 }
 
 vm_run :: proc(vm: ^VM) -> Interpret_Error {
