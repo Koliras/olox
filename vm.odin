@@ -90,11 +90,16 @@ vm_pop :: proc(vm: ^VM) -> Value {
 	return vm.stack_top^
 }
 
+vm_peek :: proc(vm: ^VM, distance: int) -> Value {
+	return mem.ptr_offset(vm.stack_top, -1 - distance)^
+}
+
 Interpret_Error :: enum {
 	None,
 	Compile_Error,
 	Runtime_Error,
 }
+
 vm_interpret :: proc(vm: ^VM, source: []byte) -> Interpret_Error {
 	chunk: Chunk
 	defer chunk_free(&chunk)
@@ -109,6 +114,14 @@ vm_interpret :: proc(vm: ^VM, source: []byte) -> Interpret_Error {
 	return result
 }
 
+vm_runtime_error :: proc(vm: ^VM, format: string, args: ..any) {
+	fmt.fprintfln(os_old.stderr, format, ..args)
+	instruction := uint(uintptr(vm.ip) - uintptr(vm.chunk.code) - 1)
+	line := vm.chunk.lines[instruction]
+	fmt.fprintf(os_old.stderr, "[line %d] in script\n", line)
+	vm_reset_stack(vm)
+}
+
 vm_run :: proc(vm: ^VM) -> Interpret_Error {
 
 	read_byte :: #force_inline proc(vm: ^VM) -> byte {
@@ -120,8 +133,12 @@ vm_run :: proc(vm: ^VM) -> Interpret_Error {
 		return vm.chunk.constants.values[read_byte(vm)]
 	}
 
-	get_numbers :: #force_inline proc(vm: ^VM) -> (Value, Value) {
-		return vm_pop(vm), vm_pop(vm)
+	get_numbers :: #force_inline proc(vm: ^VM) -> (f64, f64, bool) {
+		if !value_is_number(vm_peek(vm, 0)) || !value_is_number(vm_peek(vm, 1)) {
+			vm_runtime_error(vm, "Operands must be numbers.")
+			return 0, 0, false
+		}
+		return vm_pop(vm).as.number, vm_pop(vm).as.number, true
 	}
 
 	for {
@@ -141,21 +158,48 @@ vm_run :: proc(vm: ^VM) -> Interpret_Error {
 		case .Constant:
 			const := read_constant(vm)
 			vm_push(vm, const)
+		case .Nil:
+			vm_push(vm, value_nil())
+		case .True:
+			vm_push(vm, value_bool(true))
+		case .False:
+			vm_push(vm, value_bool(false))
+		case .Equal:
+			b := vm_pop(vm)
+			a := vm_pop(vm)
+			vm_push(vm, value_bool(values_equal(a, b)))
+		case .Greater:
+			b, a, ok := get_numbers(vm)
+			if !ok do return .Runtime_Error
+			vm_push(vm, value_bool(a > b))
+		case .Less:
+			b, a, ok := get_numbers(vm)
+			if !ok do return .Runtime_Error
+			vm_push(vm, value_bool(a < b))
 		case .Add:
-			b, a := get_numbers(vm)
-			vm_push(vm, a + b)
+			b, a, ok := get_numbers(vm)
+			if !ok do return .Runtime_Error
+			vm_push(vm, value_number(a + b))
 		case .Substract:
-			b, a := get_numbers(vm)
-			vm_push(vm, a - b)
+			b, a, ok := get_numbers(vm)
+			if !ok do return .Runtime_Error
+			vm_push(vm, value_number(a - b))
 		case .Multiply:
-			b, a := get_numbers(vm)
-			vm_push(vm, a * b)
+			b, a, ok := get_numbers(vm)
+			if !ok do return .Runtime_Error
+			vm_push(vm, value_number(a * b))
 		case .Devide:
-			b, a := get_numbers(vm)
-			vm_push(vm, a / b)
+			b, a, ok := get_numbers(vm)
+			if !ok do return .Runtime_Error
+			vm_push(vm, value_number(a / b))
+		case .Not:
+			vm_push(vm, value_bool(value_is_falsey(vm_pop(vm))))
 		case .Negate:
-			last := mem.ptr_offset(vm.stack_top, -1)
-			last^ = -last^
+			if !value_is_number(vm_peek(vm, 0)) {
+				vm_runtime_error(vm, "Operand must be a number.")
+				return .Runtime_Error
+			}
+			vm_push(vm, value_number(-vm_pop(vm).as.number))
 		case .Return:
 			value_print(vm_pop(vm))
 			fmt.print("\n")

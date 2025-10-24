@@ -60,31 +60,31 @@ PARSER_RULES: [Token_Type]Parse_Rule = {
 	.Semicolon     = {nil, nil, .None},
 	.Slash         = {nil, parser_binary, .Factor},
 	.Star          = {nil, parser_binary, .Factor},
-	.Bang          = {nil, nil, .None},
-	.Bang_Equal    = {nil, nil, .None},
+	.Bang          = {parser_unary, nil, .None},
+	.Bang_Equal    = {nil, parser_binary, .Equality},
 	.Equal         = {nil, nil, .None},
-	.Equal_Equal   = {nil, nil, .None},
-	.Greater       = {nil, nil, .None},
-	.Greater_Equal = {nil, nil, .None},
-	.Less          = {nil, nil, .None},
-	.Less_Equal    = {nil, nil, .None},
+	.Equal_Equal   = {nil, parser_binary, .Equality},
+	.Greater       = {nil, parser_binary, .Comparison},
+	.Greater_Equal = {nil, parser_binary, .Comparison},
+	.Less          = {nil, parser_binary, .Comparison},
+	.Less_Equal    = {nil, parser_binary, .Comparison},
 	.Identifier    = {nil, nil, .None},
 	.String        = {nil, nil, .None},
 	.Number        = {parser_number, nil, .None},
 	.And           = {nil, nil, .None},
 	.Class         = {nil, nil, .None},
 	.Else          = {nil, nil, .None},
-	.False         = {nil, nil, .None},
+	.False         = {parser_literal, nil, .None},
 	.For           = {nil, nil, .None},
 	.Fun           = {nil, nil, .None},
 	.If            = {nil, nil, .None},
-	.Nil           = {nil, nil, .None},
+	.Nil           = {parser_literal, nil, .None},
 	.Or            = {nil, nil, .None},
 	.Print         = {nil, nil, .None},
 	.Return        = {nil, nil, .None},
 	.Super         = {nil, nil, .None},
 	.This          = {nil, nil, .None},
-	.True          = {nil, nil, .None},
+	.True          = {parser_literal, nil, .None},
 	.Var           = {nil, nil, .None},
 	.While         = {nil, nil, .None},
 	.Error         = {nil, nil, .None},
@@ -185,6 +185,8 @@ parser_unary :: proc(p: ^Parser) {
 	parser_parse_precedence(p, .Unary)
 
 	#partial switch operator_type {
+	case .Bang:
+		parser_emit_byte(p, byte(Op_Code.Not))
 	case .Minus:
 		parser_emit_byte(p, byte(Op_Code.Negate))
 	case:
@@ -198,6 +200,18 @@ parser_binary :: proc(p: ^Parser) {
 	parser_parse_precedence(p, Parse_Precedence(byte(rule.precedence) + 1))
 
 	#partial switch operator_type {
+	case .Bang_Equal:
+		parser_emit_bytes(p, byte(Op_Code.Equal), byte(Op_Code.Not))
+	case .Equal_Equal:
+		parser_emit_byte(p, byte(Op_Code.Equal))
+	case .Greater_Equal:
+		parser_emit_bytes(p, byte(Op_Code.Less), byte(Op_Code.Not))
+	case .Greater:
+		parser_emit_byte(p, byte(Op_Code.Greater))
+	case .Less_Equal:
+		parser_emit_bytes(p, byte(Op_Code.Greater), byte(Op_Code.Not))
+	case .Less:
+		parser_emit_byte(p, byte(Op_Code.Less))
 	case .Plus:
 		parser_emit_byte(p, byte(Op_Code.Add))
 	case .Minus:
@@ -229,7 +243,20 @@ parser_parse_precedence :: proc(p: ^Parser, precedence: Parse_Precedence) {
 
 parser_number :: proc(p: ^Parser) {
 	val, _ := strconv.parse_f64(token_to_string(p.previous))
-	parser_emit_constant(p, Value(val))
+	parser_emit_constant(p, value_number(val))
+}
+
+parser_literal :: proc(p: ^Parser) {
+	#partial switch p.previous.type {
+	case .False:
+		parser_emit_byte(p, byte(Op_Code.False))
+	case .True:
+		parser_emit_byte(p, byte(Op_Code.True))
+	case .Nil:
+		parser_emit_byte(p, byte(Op_Code.Nil))
+	case:
+		unreachable()
+	}
 }
 
 get_rule :: proc(type: Token_Type) -> ^Parse_Rule {

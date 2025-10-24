@@ -2,10 +2,17 @@ package lox
 
 Op_Code :: enum u8 {
 	Constant,
+	Nil,
+	True,
+	False,
+	Equal,
+	Greater,
+	Less,
 	Add,
 	Substract,
 	Multiply,
 	Devide,
+	Not,
 	Negate,
 	Return,
 }
