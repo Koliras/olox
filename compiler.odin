@@ -1,6 +1,5 @@
 package lox
 
-import "base:runtime"
 import clang "core:c"
 import "core:fmt"
 import os_old "core:os"
@@ -69,7 +68,7 @@ PARSER_RULES: [Token_Type]Parse_Rule = {
 	.Less          = {nil, parser_binary, .Comparison},
 	.Less_Equal    = {nil, parser_binary, .Comparison},
 	.Identifier    = {nil, nil, .None},
-	.String        = {nil, nil, .None},
+	.String        = {parser_string, nil, .None},
 	.Number        = {parser_number, nil, .None},
 	.And           = {nil, nil, .None},
 	.Class         = {nil, nil, .None},
@@ -259,6 +258,14 @@ parser_literal :: proc(p: ^Parser) {
 	}
 }
 
+parser_string :: proc(p: ^Parser) {
+	parser_emit_constant(
+		p,
+		string_as_value(string_copy(&p.previous.start[1], p.previous.length - 2)),
+	)
+}
+
 get_rule :: proc(type: Token_Type) -> ^Parse_Rule {
 	return &PARSER_RULES[type]
 }
+

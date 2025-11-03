@@ -13,19 +13,34 @@ VM :: struct {
 	ip:        [^]byte,
 	stack:     [STACK_MAX]Value,
 	stack_top: ^Value,
+	objects:   ^Object,
+}
+vm: VM
+
+vm_init :: proc() {
+	vm_reset_stack()
+	vm.objects = nil
 }
 
-vm_init :: proc(vm: ^VM) {
-	vm_reset_stack(vm)
-}
 
-vm_reset_stack :: proc(vm: ^VM) {
+vm_reset_stack :: proc() {
 	vm.stack_top = &vm.stack[0]
 }
 
-vm_free :: proc(vm: ^VM) {}
+vm_free :: proc() {
+	vm_free_objects()
+}
 
-vm_repl :: proc(vm: ^VM) {
+vm_free_objects :: proc() {
+	object := vm.objects
+	for object != nil {
+		next := object.next
+		object_free(object)
+		object = next
+	}
+}
+
+vm_repl :: proc() {
 	line: [1024]byte
 
 	for {
@@ -36,14 +51,14 @@ vm_repl :: proc(vm: ^VM) {
 			break
 		}
 
-		vm_interpret(vm, line[:])
+		vm_interpret(line[:])
 	}
 }
 
-vm_run_file :: proc(vm: ^VM, fp: string, allocator := context.allocator) {
-	source, _ := _read_file(fp, allocator)
-	defer delete(source, allocator)
-	result := vm_interpret(vm, source)
+vm_run_file :: proc(fp: string) {
+	source, _ := _read_file(fp)
+	defer delete(source)
+	result := vm_interpret(source)
 
 	if result == .Compile_Error {
 		os.exit(65)
@@ -52,7 +67,7 @@ vm_run_file :: proc(vm: ^VM, fp: string, allocator := context.allocator) {
 	}
 }
 
-_read_file :: proc(path: string, allocator := context.allocator) -> (data: []byte, err: os.Error) {
+_read_file :: proc(path: string) -> (data: []byte, err: os.Error) {
 	file, file_err := os.open(path)
 	if file_err != nil {
 		fmt.fprintfln(os_old.stderr, "Could not open file \"%s\".", path)
@@ -63,7 +78,7 @@ _read_file :: proc(path: string, allocator := context.allocator) -> (data: []byt
 
 	file_size := os.file_size(file) or_return
 	allocation_err: runtime.Allocator_Error
-	data, allocation_err = make([]byte, file_size + 1, allocator)
+	data, allocation_err = make([]byte, file_size + 1)
 	if allocation_err != nil {
 		fmt.fprintfln(os_old.stderr, "Not enough memory to read \"%s\".", path)
 		os.exit(74)
@@ -80,17 +95,17 @@ _read_file :: proc(path: string, allocator := context.allocator) -> (data: []byt
 	return data, nil
 }
 
-vm_push :: proc(vm: ^VM, val: Value) {
+vm_push :: proc(val: Value) {
 	vm.stack_top^ = val
 	vm.stack_top = mem.ptr_offset(vm.stack_top, 1)
 }
 
-vm_pop :: proc(vm: ^VM) -> Value {
+vm_pop :: proc() -> Value {
 	vm.stack_top = mem.ptr_offset(vm.stack_top, -1)
 	return vm.stack_top^
 }
 
-vm_peek :: proc(vm: ^VM, distance: int) -> Value {
+vm_peek :: proc(distance: int) -> Value {
 	return mem.ptr_offset(vm.stack_top, -1 - distance)^
 }
 
@@ -100,7 +115,7 @@ Interpret_Error :: enum {
 	Runtime_Error,
 }
 
-vm_interpret :: proc(vm: ^VM, source: []byte) -> Interpret_Error {
+vm_interpret :: proc(source: []byte) -> Interpret_Error {
 	chunk: Chunk
 	defer chunk_free(&chunk)
 	if !compile(source, &chunk) {
@@ -110,35 +125,35 @@ vm_interpret :: proc(vm: ^VM, source: []byte) -> Interpret_Error {
 	vm.chunk = &chunk
 	vm.ip = chunk.code
 
-	result := vm_run(vm)
+	result := vm_run()
 	return result
 }
 
-vm_runtime_error :: proc(vm: ^VM, format: string, args: ..any) {
+vm_runtime_error :: proc(format: string, args: ..any) {
 	fmt.fprintfln(os_old.stderr, format, ..args)
 	instruction := uint(uintptr(vm.ip) - uintptr(vm.chunk.code) - 1)
 	line := vm.chunk.lines[instruction]
 	fmt.fprintf(os_old.stderr, "[line %d] in script\n", line)
-	vm_reset_stack(vm)
+	vm_reset_stack()
 }
 
-vm_run :: proc(vm: ^VM) -> Interpret_Error {
+vm_run :: proc() -> Interpret_Error {
 
-	read_byte :: #force_inline proc(vm: ^VM) -> byte {
+	read_byte :: #force_inline proc() -> byte {
 		instruction := (cast(^byte)vm.ip)^
 		vm.ip = cast([^]byte)(uintptr(vm.ip) + 1)
 		return instruction
 	}
-	read_constant :: #force_inline proc(vm: ^VM) -> Value {
-		return vm.chunk.constants.values[read_byte(vm)]
+	read_constant :: #force_inline proc() -> Value {
+		return vm.chunk.constants.values[read_byte()]
 	}
 
-	get_numbers :: #force_inline proc(vm: ^VM) -> (f64, f64, bool) {
-		if !value_is_number(vm_peek(vm, 0)) || !value_is_number(vm_peek(vm, 1)) {
-			vm_runtime_error(vm, "Operands must be numbers.")
+	get_numbers :: #force_inline proc() -> (f64, f64, bool) {
+		if !value_is_number(vm_peek(0)) || !value_is_number(vm_peek(1)) {
+			vm_runtime_error("Operands must be numbers.")
 			return 0, 0, false
 		}
-		return vm_pop(vm).as.number, vm_pop(vm).as.number, true
+		return vm_pop().as.number, vm_pop().as.number, true
 	}
 
 	for {
@@ -153,58 +168,77 @@ vm_run :: proc(vm: ^VM) -> Interpret_Error {
 			disassemble_instruction(vm.chunk, int(uintptr(vm.ip) - uintptr(vm.chunk.code)))
 		}
 
-		instruction := Op_Code(read_byte(vm))
+		instruction := Op_Code(read_byte())
 		switch instruction {
 		case .Constant:
-			const := read_constant(vm)
-			vm_push(vm, const)
+			const := read_constant()
+			vm_push(const)
 		case .Nil:
-			vm_push(vm, value_nil())
+			vm_push(value_nil())
 		case .True:
-			vm_push(vm, value_bool(true))
+			vm_push(value_bool(true))
 		case .False:
-			vm_push(vm, value_bool(false))
+			vm_push(value_bool(false))
 		case .Equal:
-			b := vm_pop(vm)
-			a := vm_pop(vm)
-			vm_push(vm, value_bool(values_equal(a, b)))
+			b := vm_pop()
+			a := vm_pop()
+			vm_push(value_bool(values_equal(a, b)))
 		case .Greater:
-			b, a, ok := get_numbers(vm)
+			b, a, ok := get_numbers()
 			if !ok do return .Runtime_Error
-			vm_push(vm, value_bool(a > b))
+			vm_push(value_bool(a > b))
 		case .Less:
-			b, a, ok := get_numbers(vm)
+			b, a, ok := get_numbers()
 			if !ok do return .Runtime_Error
-			vm_push(vm, value_bool(a < b))
+			vm_push(value_bool(a < b))
 		case .Add:
-			b, a, ok := get_numbers(vm)
-			if !ok do return .Runtime_Error
-			vm_push(vm, value_number(a + b))
-		case .Substract:
-			b, a, ok := get_numbers(vm)
-			if !ok do return .Runtime_Error
-			vm_push(vm, value_number(a - b))
-		case .Multiply:
-			b, a, ok := get_numbers(vm)
-			if !ok do return .Runtime_Error
-			vm_push(vm, value_number(a * b))
-		case .Devide:
-			b, a, ok := get_numbers(vm)
-			if !ok do return .Runtime_Error
-			vm_push(vm, value_number(a / b))
-		case .Not:
-			vm_push(vm, value_bool(value_is_falsey(vm_pop(vm))))
-		case .Negate:
-			if !value_is_number(vm_peek(vm, 0)) {
-				vm_runtime_error(vm, "Operand must be a number.")
+			if object_is_type(vm_peek(0), .String) && object_is_type(vm_peek(1), .String) {
+				vm_concatenate()
+			} else if !value_is_number(vm_peek(0)) || !value_is_number(vm_peek(1)) {
+				a, b := vm_pop().as.number, vm_pop().as.number
+				vm_push(value_number(a + b))
+			} else {
+				vm_runtime_error("Operands must be two numbers or two strings.")
 				return .Runtime_Error
 			}
-			vm_push(vm, value_number(-vm_pop(vm).as.number))
+		case .Substract:
+			b, a, ok := get_numbers()
+			if !ok do return .Runtime_Error
+			vm_push(value_number(a - b))
+		case .Multiply:
+			b, a, ok := get_numbers()
+			if !ok do return .Runtime_Error
+			vm_push(value_number(a * b))
+		case .Devide:
+			b, a, ok := get_numbers()
+			if !ok do return .Runtime_Error
+			vm_push(value_number(a / b))
+		case .Not:
+			vm_push(value_bool(value_is_falsey(vm_pop())))
+		case .Negate:
+			if !value_is_number(vm_peek(0)) {
+				vm_runtime_error("Operand must be a number.")
+				return .Runtime_Error
+			}
+			vm_push(value_number(-vm_pop().as.number))
 		case .Return:
-			value_print(vm_pop(vm))
+			value_print(vm_pop())
 			fmt.print("\n")
 			return .None
 		}
 	}
 	return .None
 }
+
+vm_concatenate :: proc() {
+	b, a := object_as_string(vm_pop()), object_as_string(vm_pop())
+	length := a.length + b.length
+	chars := allocate(byte, length + 1)
+	mem.copy_non_overlapping(chars, a.chars, a.length)
+	mem.copy_non_overlapping(&chars[a.length], b.chars, b.length)
+	chars[length] = 0
+
+	str := string_allocate(chars, length)
+	vm_push(string_as_value(str))
+}
+

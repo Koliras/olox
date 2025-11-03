@@ -1,17 +1,21 @@
 package lox
 
 import "core:fmt"
+import "core:mem"
 
 Value_Type :: enum {
 	Nil,
 	Bool,
 	Number,
+	Object,
 }
+
 Value :: struct {
 	type: Value_Type,
 	as:   struct #raw_union {
 		boolean: bool,
 		number:  f64,
+		object:  ^Object,
 	},
 }
 
@@ -24,6 +28,9 @@ value_number :: #force_inline proc(n: f64) -> Value {
 value_nil :: #force_inline proc() -> Value {
 	return {}
 }
+value_object :: #force_inline proc(object: ^Object) -> Value {
+	return {.Object, {object = object}}
+}
 
 value_is_bool :: #force_inline proc(val: Value) -> bool {
 	return val.type == .Bool
@@ -33,6 +40,9 @@ value_is_nil :: #force_inline proc(val: Value) -> bool {
 }
 value_is_number :: #force_inline proc(val: Value) -> bool {
 	return val.type == .Number
+}
+value_is_object :: #force_inline proc(val: Value) -> bool {
+	return val.type == .Object
 }
 
 value_is_falsey :: proc(val: Value) -> bool {
@@ -48,8 +58,11 @@ values_equal :: proc(a, b: Value) -> bool {
 		return a.as.number == b.as.number
 	case .Bool:
 		return a.as.boolean == b.as.boolean
+	case .Object:
+		str_a, str_b := object_as_string(a), object_as_string(b)
+		return mem.compare_ptrs(str_a.chars, str_b.chars, str_a.length) == 0
 	case:
-		return false
+		unreachable()
 	}
 }
 
@@ -71,8 +84,8 @@ value_array_write :: proc(va: ^Value_Array, val: Value) {
 }
 
 
-value_array_free :: proc(va: ^Value_Array, allocator := context.allocator) {
-	free(va.values, allocator)
+value_array_free :: proc(va: ^Value_Array) {
+	free(va.values)
 	va^ = {}
 }
 
@@ -84,5 +97,8 @@ value_print :: proc(val: Value) {
 		fmt.printf("nil")
 	case .Number:
 		fmt.printf("%g", val.as.number)
+	case .Object:
+		object_print(val)
 	}
 }
+

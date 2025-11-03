@@ -39,10 +39,10 @@ chunk_write :: proc(c: ^Chunk, b: byte, line: int) {
 }
 
 
-chunk_free :: proc(c: ^Chunk, allocator := context.allocator) {
-	free(c.code, allocator)
-	free(c.lines, allocator)
-	value_array_free(&c.constants, allocator)
+chunk_free :: proc(c: ^Chunk) {
+	free(c.code)
+	free(c.lines)
+	value_array_free(&c.constants)
 	c^ = {}
 }
 
@@ -50,3 +50,4 @@ chunk_add_const :: proc(c: ^Chunk, val: Value) -> int {
 	value_array_write(&c.constants, val)
 	return c.constants.count - 1
 }
+

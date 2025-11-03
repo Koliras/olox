@@ -1,9 +1,6 @@
 package lox
 
-import "base:runtime"
-import "core:fmt"
 import "core:mem"
-import "core:unicode/utf8"
 
 Scanner :: struct {
 	start:   ^byte,
@@ -308,3 +305,4 @@ char_is_digit :: proc(r: byte) -> bool {
 char_is_alpha :: proc(b: byte) -> bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_'
 }
+
