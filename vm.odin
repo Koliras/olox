@@ -13,6 +13,7 @@ VM :: struct {
 	ip:        [^]byte,
 	stack:     [STACK_MAX]Value,
 	stack_top: ^Value,
+	strings:   Table,
 	objects:   ^Object,
 }
 vm: VM
@@ -28,6 +29,7 @@ vm_reset_stack :: proc() {
 }
 
 vm_free :: proc() {
+	table_free(&vm.strings)
 	vm_free_objects()
 }
 
@@ -238,7 +240,7 @@ vm_concatenate :: proc() {
 	mem.copy_non_overlapping(&chars[a.length], b.chars, b.length)
 	chars[length] = 0
 
-	str := string_allocate(chars, length)
+	str := string_take(chars, length)
 	vm_push(string_as_value(str))
 }
 

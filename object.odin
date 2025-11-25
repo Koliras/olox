@@ -16,6 +16,7 @@ Object_String :: struct {
 	object: Object,
 	length: int,
 	chars:  [^]byte,
+	hash:   u32,
 }
 
 object_type :: #force_inline proc(val: Value) -> Object_Type {
@@ -65,16 +66,43 @@ string_as_value :: #force_inline proc(str: ^Object_String) -> Value {
 
 }
 
+string_take :: proc(chars: [^]byte, len: int) -> ^Object_String {
+	hash := string_hash(chars, len)
+	interned := table_find_string(&vm.strings, chars, len, hash)
+	if interned != nil {
+		free(chars)
+		return interned
+	}
+	return string_allocate(chars, len, hash)
+}
+
 string_copy :: proc(chars: [^]byte, len: int) -> ^Object_String {
+	hash := string_hash(chars, len)
+	interned := table_find_string(&vm.strings, chars, len, hash)
+	if interned != nil {
+		return interned
+	}
 	heap_chars := allocate(byte, len + 1)
 	mem.copy_non_overlapping(heap_chars, chars, len)
 	heap_chars[len] = 0
-	return string_allocate(heap_chars, len)
+	return string_allocate(heap_chars, len, hash)
 }
 
-string_allocate :: proc(chars: [^]byte, len: int) -> ^Object_String {
+string_allocate :: proc(chars: [^]byte, len: int, hash: u32) -> ^Object_String {
 	str := object_allocate(Object_String, .String)
 	str.length = len
 	str.chars = chars
+	str.hash = hash
+	table_set(&vm.strings, str, value_nil())
 	return str
 }
+
+string_hash :: proc(chars: [^]byte, len: int) -> u32 {
+	hash: u32 = 2166136261
+	for i := 0; i < len; i += 1 {
+		hash ~= cast(u32)chars[i]
+		hash *= 16777619
+	}
+	return hash
+}
+

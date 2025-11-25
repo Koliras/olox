@@ -59,8 +59,7 @@ values_equal :: proc(a, b: Value) -> bool {
 	case .Bool:
 		return a.as.boolean == b.as.boolean
 	case .Object:
-		str_a, str_b := object_as_string(a), object_as_string(b)
-		return mem.compare_ptrs(str_a.chars, str_b.chars, str_a.length) == 0
+		return a.as.object == b.as.object
 	case:
 		unreachable()
 	}
