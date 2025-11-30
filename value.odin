@@ -1,7 +1,6 @@
 package lox
 
 import "core:fmt"
-import "core:mem"
 
 Value_Type :: enum {
 	Nil,

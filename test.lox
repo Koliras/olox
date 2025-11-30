@@ -1,1 +1,5 @@
-"foo bar" + "baz"
+var breakfast = "beignets";
+var beverage = "cafe au lait";
+breakfast = breakfast + " with " + beverage;
+
+print breakfast;

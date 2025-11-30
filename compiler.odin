@@ -12,8 +12,11 @@ compile :: proc(source: []byte, chunk: ^Chunk) -> bool {
 	parser.scanner = &scanner
 	parser.chunk = chunk
 	parser_advance(&parser)
-	parser_expression(&parser)
-	parser_consume(&parser, .Eof, "Expect end of expression.")
+
+	for !parser_match(&parser, .Eof) {
+		parser_declaration(&parser)
+	}
+
 	parser_end_compiler(&parser)
 	return !parser.had_error
 }
@@ -41,7 +44,7 @@ Parse_Precedence :: enum u8 {
 	Primary,
 }
 
-Parse_Fn :: proc(parser: ^Parser)
+Parse_Fn :: proc(parser: ^Parser, can_assign: bool)
 Parse_Rule :: struct {
 	prefix, infix: Parse_Fn,
 	precedence:    Parse_Precedence,
@@ -67,7 +70,7 @@ PARSER_RULES: [Token_Type]Parse_Rule = {
 	.Greater_Equal = {nil, parser_binary, .Comparison},
 	.Less          = {nil, parser_binary, .Comparison},
 	.Less_Equal    = {nil, parser_binary, .Comparison},
-	.Identifier    = {nil, nil, .None},
+	.Identifier    = {parser_variable, nil, .None},
 	.String        = {parser_string, nil, .None},
 	.Number        = {parser_number, nil, .None},
 	.And           = {nil, nil, .None},
@@ -149,14 +152,11 @@ parser_emit_return :: proc(p: ^Parser) {
 }
 
 parser_emit_constant :: proc(p: ^Parser, val: Value) {
-	parser_emit_bytes(p, cast(byte)Op_Code.Constant, parser_make_constant(p, val, p.chunk))
+	parser_emit_bytes(p, cast(byte)Op_Code.Constant, parser_make_constant(p, val))
 }
 
-parser_make_constant :: proc(p: ^Parser, val: Value, chunk: ^Chunk = nil) -> byte {
-	chunk := chunk
-	if chunk == nil {
-		chunk = p.chunk
-	}
+parser_make_constant :: proc(p: ^Parser, val: Value) -> byte {
+	chunk := p.chunk
 	const := chunk_add_const(chunk, val)
 	if const > int(clang.UINT8_MAX) {
 		parser_error(p, "Too many constants in one chunk.")
@@ -174,12 +174,12 @@ parser_end_compiler :: proc(p: ^Parser) {
 	}
 }
 
-parser_grouping :: proc(p: ^Parser) {
+parser_grouping :: proc(p: ^Parser, can_assign: bool) {
 	parser_expression(p)
 	parser_consume(p, .Right_Paren, "Expect ')' after expression.")
 }
 
-parser_unary :: proc(p: ^Parser) {
+parser_unary :: proc(p: ^Parser, can_assign: bool) {
 	operator_type := p.previous.type
 	parser_parse_precedence(p, .Unary)
 
@@ -193,7 +193,7 @@ parser_unary :: proc(p: ^Parser) {
 	}
 }
 
-parser_binary :: proc(p: ^Parser) {
+parser_binary :: proc(p: ^Parser, can_assign: bool) {
 	operator_type := p.previous.type
 	rule := get_rule(operator_type)
 	parser_parse_precedence(p, Parse_Precedence(byte(rule.precedence) + 1))
@@ -231,21 +231,27 @@ parser_parse_precedence :: proc(p: ^Parser, precedence: Parse_Precedence) {
 		parser_error(p, "Expect expression.")
 		return
 	}
-	prefix_rule(p)
+
+	can_assign := precedence <= Parse_Precedence.Assignment
+	prefix_rule(p, can_assign)
 
 	for byte(precedence) <= byte(get_rule(p.current.type).precedence) {
 		parser_advance(p)
 		infix_rule := get_rule(p.previous.type).infix
-		infix_rule(p)
+		infix_rule(p, can_assign)
+	}
+
+	if can_assign && parser_match(p, .Equal) {
+		parser_error(p, "Invalid assignment target.")
 	}
 }
 
-parser_number :: proc(p: ^Parser) {
+parser_number :: proc(p: ^Parser, can_assign: bool) {
 	val, _ := strconv.parse_f64(token_to_string(p.previous))
 	parser_emit_constant(p, value_number(val))
 }
 
-parser_literal :: proc(p: ^Parser) {
+parser_literal :: proc(p: ^Parser, can_assign: bool) {
 	#partial switch p.previous.type {
 	case .False:
 		parser_emit_byte(p, byte(Op_Code.False))
@@ -258,7 +264,7 @@ parser_literal :: proc(p: ^Parser) {
 	}
 }
 
-parser_string :: proc(p: ^Parser) {
+parser_string :: proc(p: ^Parser, can_assign: bool) {
 	parser_emit_constant(
 		p,
 		string_as_value(string_copy(&p.previous.start[1], p.previous.length - 2)),
@@ -267,5 +273,106 @@ parser_string :: proc(p: ^Parser) {
 
 get_rule :: proc(type: Token_Type) -> ^Parse_Rule {
 	return &PARSER_RULES[type]
+}
+
+parser_match :: proc(p: ^Parser, type: Token_Type) -> bool {
+	if !parser_check(p, type) do return false
+	parser_advance(p)
+	return true
+}
+
+parser_check :: proc(p: ^Parser, type: Token_Type) -> bool {
+	return p.current.type == type
+}
+
+parser_declaration :: proc(p: ^Parser) {
+	if parser_match(p, .Var) {
+		parser_var_declaration(p)
+	} else {
+		parser_statement(p)
+	}
+
+	if p.panic_mode {
+		parser_synchronize(p)
+	}
+}
+
+parser_statement :: proc(p: ^Parser) {
+	if parser_match(p, .Print) {
+		parser_print_statement(p)
+	} else {
+		parser_expression_statement(p)
+	}
+}
+
+parser_print_statement :: proc(p: ^Parser) {
+	parser_expression(p)
+	parser_consume(p, .Semicolon, "Expect ';' after value.")
+	parser_emit_byte(p, cast(byte)Op_Code.Print)
+}
+
+parser_expression_statement :: proc(p: ^Parser) {
+	parser_expression(p)
+	parser_consume(p, .Semicolon, "Expect ';' after expression.")
+	parser_emit_byte(p, cast(byte)Op_Code.Pop)
+}
+
+parser_synchronize :: proc(p: ^Parser) {
+	p.panic_mode = false
+
+	for !parser_check(p, .Eof) {
+		if p.previous.type == .Semicolon do return
+		#partial switch p.current.type {
+		case .Class, .Fun, .Var, .For, .If, .While, .Print, .Return:
+			return
+		}
+
+		parser_advance(p)
+	}
+}
+
+parser_var_declaration :: proc(p: ^Parser) {
+	global := parser_parse_variable(p, "Expect variable name.")
+
+	if parser_match(p, .Equal) {
+		parser_expression(p)
+	} else {
+		parser_emit_byte(p, cast(byte)Op_Code.Nil)
+	}
+	parser_consume(p, .Semicolon, "Expect ';' after variable declaration")
+
+	parser_define_variable(p, global)
+}
+
+parser_parse_variable :: proc(p: ^Parser, error_message: string) -> byte {
+	parser_consume(p, .Identifier, error_message)
+	return parser_identifier_constant(p, &p.previous)
+}
+
+parser_identifier_constant :: proc(p: ^Parser, name: ^Token) -> byte {
+	return parser_make_constant(
+		p,
+		value_object(cast(^Object)rawptr(string_copy(name.start, name.length))),
+	)
+}
+
+parser_define_variable :: proc(p: ^Parser, global: byte) {
+	parser_emit_bytes(p, cast(byte)Op_Code.Define_Global, global)
+}
+
+parser_variable :: proc(p: ^Parser, can_assign: bool) {
+	parser_named_variable(p, p.previous, can_assign)
+}
+
+parser_named_variable :: proc(p: ^Parser, name: Token, can_assign: bool) {
+	name := name
+	arg := parser_identifier_constant(p, &name)
+
+	if can_assign && parser_match(p, .Equal) {
+		parser_expression(p)
+		parser_emit_bytes(p, cast(byte)Op_Code.Set_Global, arg)
+	} else {
+		parser_emit_bytes(p, cast(byte)Op_Code.Get_Global, arg)
+	}
 }
 

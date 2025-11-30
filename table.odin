@@ -81,14 +81,13 @@ table_add_all :: proc(from, to: ^Table) {
 	}
 }
 
-table_get :: proc(table: ^Table, key: ^Object_String, val: ^Value) -> bool {
-	if table.count == 0 do return false
+table_get :: proc(table: ^Table, key: ^Object_String) -> (Value, bool) {
+	if table.count == 0 do return {}, false
 
 	entry := find_entry(table.entries, table.capacity, key)
-	if entry.key == nil do return false
+	if entry.key == nil do return {}, false
 
-	val^ = entry.value
-	return true
+	return entry.value, true
 }
 
 table_delete :: proc(table: ^Table, key: ^Object_String) -> bool {
@@ -124,3 +123,4 @@ table_find_string :: proc(
 		idx = (idx + 1) % u32(table.capacity)
 	}
 }
+

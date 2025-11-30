@@ -13,6 +13,7 @@ VM :: struct {
 	ip:        [^]byte,
 	stack:     [STACK_MAX]Value,
 	stack_top: ^Value,
+	globals:   Table,
 	strings:   Table,
 	objects:   ^Object,
 }
@@ -29,6 +30,7 @@ vm_reset_stack :: proc() {
 }
 
 vm_free :: proc() {
+	table_free(&vm.globals)
 	table_free(&vm.strings)
 	vm_free_objects()
 }
@@ -149,6 +151,9 @@ vm_run :: proc() -> Interpret_Error {
 	read_constant :: #force_inline proc() -> Value {
 		return vm.chunk.constants.values[read_byte()]
 	}
+	read_string :: #force_inline proc() -> ^Object_String {
+		return object_as_string(read_constant())
+	}
 
 	get_numbers :: #force_inline proc() -> (f64, f64, bool) {
 		if !value_is_number(vm_peek(0)) || !value_is_number(vm_peek(1)) {
@@ -181,12 +186,34 @@ vm_run :: proc() -> Interpret_Error {
 			vm_push(value_bool(true))
 		case .False:
 			vm_push(value_bool(false))
+		case .Pop:
+			vm_pop()
+		case .Get_Global:
+			name := read_string()
+			value, defined_var := table_get(&vm.globals, name)
+			if !defined_var {
+				vm_runtime_error("Undefined variable '%s'.", name.chars)
+				return .Runtime_Error
+			}
+			vm_push(value)
+		case .Define_Global:
+			name := read_string()
+			table_set(&vm.globals, name, vm_peek(0))
+			vm_pop()
+		case .Set_Global:
+			name := read_string()
+			if table_set(&vm.globals, name, vm_peek(0)) {
+				table_delete(&vm.globals, name)
+				vm_runtime_error("Undefined variable '%s'.", name.chars)
+				return .Runtime_Error
+			}
 		case .Equal:
 			b := vm_pop()
 			a := vm_pop()
 			vm_push(value_bool(values_equal(a, b)))
 		case .Greater:
 			b, a, ok := get_numbers()
+			fmt.println("foo")
 			if !ok do return .Runtime_Error
 			vm_push(value_bool(a > b))
 		case .Less:
@@ -196,7 +223,7 @@ vm_run :: proc() -> Interpret_Error {
 		case .Add:
 			if object_is_type(vm_peek(0), .String) && object_is_type(vm_peek(1), .String) {
 				vm_concatenate()
-			} else if !value_is_number(vm_peek(0)) || !value_is_number(vm_peek(1)) {
+			} else if value_is_number(vm_peek(0)) && value_is_number(vm_peek(1)) {
 				a, b := vm_pop().as.number, vm_pop().as.number
 				vm_push(value_number(a + b))
 			} else {
@@ -223,9 +250,10 @@ vm_run :: proc() -> Interpret_Error {
 				return .Runtime_Error
 			}
 			vm_push(value_number(-vm_pop().as.number))
-		case .Return:
+		case .Print:
 			value_print(vm_pop())
-			fmt.print("\n")
+			fmt.printf("\n")
+		case .Return:
 			return .None
 		}
 	}
@@ -243,4 +271,3 @@ vm_concatenate :: proc() {
 	str := string_take(chars, length)
 	vm_push(string_as_value(str))
 }
-

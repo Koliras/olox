@@ -1,6 +1,7 @@
 package lox
 
 import "core:fmt"
+
 disassemble_chunk :: proc(c: ^Chunk, name: string) {
 	fmt.printfln("== %s ==", name)
 
@@ -28,6 +29,14 @@ disassemble_instruction :: proc(c: ^Chunk, offset: int) -> int {
 		return simple_instruction("OP_TRUE", offset)
 	case .False:
 		return simple_instruction("OP_FALSE", offset)
+	case .Pop:
+		return simple_instruction("OP_POP", offset)
+	case .Get_Global:
+		return constant_instruction("OP_GET_GLOBAL", c, offset)
+	case .Define_Global:
+		return constant_instruction("OP_DEFINE_GLOBAL", c, offset)
+	case .Set_Global:
+		return constant_instruction("OP_SET_GLOBAL", c, offset)
 	case .Equal:
 		return simple_instruction("OP_EQUAL", offset)
 	case .Greater:
@@ -46,6 +55,8 @@ disassemble_instruction :: proc(c: ^Chunk, offset: int) -> int {
 		return simple_instruction("OP_MULTIPLY", offset)
 	case .Negate:
 		return simple_instruction("OP_NEGATE", offset)
+	case .Print:
+		return simple_instruction("OP_PRINT", offset)
 	case .Return:
 		return simple_instruction("OP_RETURN", offset)
 	case:
@@ -66,3 +77,4 @@ constant_instruction :: proc(name: string, chunk: ^Chunk, offset: int) -> int {
 	fmt.printf("'\n")
 	return offset + 2
 }
+
