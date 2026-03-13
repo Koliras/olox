@@ -3,8 +3,7 @@ package lox
 import "base:runtime"
 import "core:fmt"
 import "core:mem"
-import os_old "core:os"
-import os "core:os/os2"
+import "core:os"
 
 STACK_MAX :: 256
 
@@ -74,7 +73,7 @@ vm_run_file :: proc(fp: string) {
 _read_file :: proc(path: string) -> (data: []byte, err: os.Error) {
 	file, file_err := os.open(path)
 	if file_err != nil {
-		fmt.fprintfln(os_old.stderr, "Could not open file \"%s\".", path)
+		fmt.fprintfln(os.stderr, "Could not open file \"%s\".", path)
 		os.exit(74)
 	}
 
@@ -84,13 +83,13 @@ _read_file :: proc(path: string) -> (data: []byte, err: os.Error) {
 	allocation_err: runtime.Allocator_Error
 	data, allocation_err = make([]byte, file_size + 1)
 	if allocation_err != nil {
-		fmt.fprintfln(os_old.stderr, "Not enough memory to read \"%s\".", path)
+		fmt.fprintfln(os.stderr, "Not enough memory to read \"%s\".", path)
 		os.exit(74)
 	}
 
 	bytes_read, _ := os.read(file, data[:])
 	if i64(bytes_read) < file_size {
-		fmt.fprintfln(os_old.stderr, "Could not read file \"%s\".", path)
+		fmt.fprintfln(os.stderr, "Could not read file \"%s\".", path)
 		os.exit(74)
 	}
 
@@ -134,10 +133,10 @@ vm_interpret :: proc(source: []byte) -> Interpret_Error {
 }
 
 vm_runtime_error :: proc(format: string, args: ..any) {
-	fmt.fprintfln(os_old.stderr, format, ..args)
+	fmt.fprintfln(os.stderr, format, ..args)
 	instruction := uint(uintptr(vm.ip) - uintptr(vm.chunk.code) - 1)
 	line := vm.chunk.lines[instruction]
-	fmt.fprintf(os_old.stderr, "[line %d] in script\n", line)
+	fmt.fprintf(os.stderr, "[line %d] in script\n", line)
 	vm_reset_stack()
 }
 
@@ -196,6 +195,9 @@ vm_run :: proc() -> Interpret_Error {
 				return .Runtime_Error
 			}
 			vm_push(value)
+		case .Get_Local:
+			slot := read_byte()
+			vm_push(vm.stack[slot])
 		case .Define_Global:
 			name := read_string()
 			table_set(&vm.globals, name, vm_peek(0))
@@ -207,6 +209,9 @@ vm_run :: proc() -> Interpret_Error {
 				vm_runtime_error("Undefined variable '%s'.", name.chars)
 				return .Runtime_Error
 			}
+		case .Set_Local:
+			slot := read_byte()
+			vm.stack[slot] = vm_peek(0)
 		case .Equal:
 			b := vm_pop()
 			a := vm_pop()
@@ -271,3 +276,4 @@ vm_concatenate :: proc() {
 	str := string_take(chars, length)
 	vm_push(string_as_value(str))
 }
+

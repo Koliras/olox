@@ -1,8 +1,7 @@
 package lox
 
 import "core:fmt"
-import os_old "core:os"
-import os "core:os/os2"
+import "core:os"
 
 main :: proc() {
 	vm: VM
@@ -14,7 +13,7 @@ main :: proc() {
 	} else if len(args) == 2 {
 		vm_run_file(args[1])
 	} else {
-		fmt.fprintln(os_old.stderr, "Usage: olox [path]")
+		fmt.fprintln(os.stderr, "Usage: olox [path]")
 		os.exit(69)
 	}
 

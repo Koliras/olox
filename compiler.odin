@@ -2,12 +2,17 @@ package lox
 
 import clang "core:c"
 import "core:fmt"
+import "core:mem"
 import os_old "core:os"
 import "core:strconv"
+
+compiler: ^Compiler = nil
 
 compile :: proc(source: []byte, chunk: ^Chunk) -> bool {
 	scanner: Scanner
 	scanner_init(&scanner, source)
+	compiler: Compiler
+	compiler_init(&compiler)
 	parser: Parser
 	parser.scanner = &scanner
 	parser.chunk = chunk
@@ -19,6 +24,17 @@ compile :: proc(source: []byte, chunk: ^Chunk) -> bool {
 
 	parser_end_compiler(&parser)
 	return !parser.had_error
+}
+
+Compiler :: struct {
+	locals:      [256]Local,
+	local_count: int,
+	scope_depth: int,
+}
+
+Local :: struct {
+	name:  Token,
+	depth: int,
 }
 
 Parser :: struct {
@@ -300,6 +316,10 @@ parser_declaration :: proc(p: ^Parser) {
 parser_statement :: proc(p: ^Parser) {
 	if parser_match(p, .Print) {
 		parser_print_statement(p)
+	} else if parser_match(p, .Left_Brace) {
+		scope_begin()
+		parser_block(p)
+		scope_end(p)
 	} else {
 		parser_expression_statement(p)
 	}
@@ -346,7 +366,35 @@ parser_var_declaration :: proc(p: ^Parser) {
 
 parser_parse_variable :: proc(p: ^Parser, error_message: string) -> byte {
 	parser_consume(p, .Identifier, error_message)
+
+	parser_declare_variable(p)
+	if compiler.scope_depth > 0 {
+		return 0
+	}
+
 	return parser_identifier_constant(p, &p.previous)
+}
+
+parser_declare_variable :: proc(p: ^Parser) {
+	if compiler.scope_depth > 0 do return
+
+	name := &p.previous
+	for i := compiler.local_count - 1; i >= 0; i -= 1 {
+		local := &compiler.locals[i]
+		if local.depth != -1 && local.depth < compiler.scope_depth {
+			break
+		}
+
+		if identifiers_equal(name, &local.name) {
+			parser_error(p, "There already is a variable with this name in the scope")
+		}
+	}
+	parser_add_local(p, name^)
+}
+
+identifiers_equal :: proc(a, b: ^Token) -> bool {
+	if a.length != b.length do return false
+	return mem.compare_byte_ptrs(a.start, b.start, a.length) == 0
 }
 
 parser_identifier_constant :: proc(p: ^Parser, name: ^Token) -> byte {
@@ -357,6 +405,11 @@ parser_identifier_constant :: proc(p: ^Parser, name: ^Token) -> byte {
 }
 
 parser_define_variable :: proc(p: ^Parser, global: byte) {
+	if compiler.scope_depth > 0 {
+		compiler_mark_initialized()
+		return
+	}
+
 	parser_emit_bytes(p, cast(byte)Op_Code.Define_Global, global)
 }
 
@@ -366,13 +419,77 @@ parser_variable :: proc(p: ^Parser, can_assign: bool) {
 
 parser_named_variable :: proc(p: ^Parser, name: Token, can_assign: bool) {
 	name := name
-	arg := parser_identifier_constant(p, &name)
+	get_op, set_op: byte
+	arg := compiler_resolve_local(compiler, p, &name)
+	if arg != -1 {
+		get_op = cast(byte)Op_Code.Get_Local
+		set_op = cast(byte)Op_Code.Set_Local
+	} else {
+		arg = cast(int)parser_identifier_constant(p, &name)
+		get_op = cast(byte)Op_Code.Get_Global
+		set_op = cast(byte)Op_Code.Set_Global
+	}
 
 	if can_assign && parser_match(p, .Equal) {
 		parser_expression(p)
-		parser_emit_bytes(p, cast(byte)Op_Code.Set_Global, arg)
+		parser_emit_bytes(p, set_op, cast(byte)arg)
 	} else {
-		parser_emit_bytes(p, cast(byte)Op_Code.Get_Global, arg)
+		parser_emit_bytes(p, get_op, cast(byte)arg)
 	}
 }
 
+parser_block :: proc(p: ^Parser) {
+	for !parser_check(p, .Right_Brace) && !parser_check(p, .Eof) {
+		parser_declaration(p)
+	}
+
+	parser_consume(p, .Right_Brace, "Expect '}' after block.")
+}
+
+compiler_init :: proc(c: ^Compiler) {
+	c.local_count = 0
+	c.scope_depth = 0
+	compiler = c
+}
+
+compiler_resolve_local :: proc(c: ^Compiler, p: ^Parser, name: ^Token) -> int {
+	for i := c.local_count - 1; i >= 0; i -= 1 {
+		local := &c.locals[i]
+		if identifiers_equal(&local.name, name) {
+			if local.depth == -1 {
+				parser_error(p, "Can't read variable in its own initializer.")
+			}
+			return i
+		}
+	}
+	return -1
+}
+
+compiler_mark_initialized :: proc() {
+	compiler.locals[compiler.local_count - 1].depth = compiler.scope_depth
+}
+
+scope_begin :: proc() {
+	compiler.scope_depth += 1
+}
+
+scope_end :: proc(p: ^Parser) {
+	compiler.scope_depth -= 1
+
+	for compiler.local_count > 0 &&
+	    compiler.locals[compiler.local_count - 1].depth > compiler.scope_depth {
+		parser_emit_byte(p, cast(byte)Op_Code.Pop)
+		compiler.local_count -= 1
+	}
+}
+
+parser_add_local :: proc(p: ^Parser, name: Token) {
+	if compiler.local_count == cast(int)max(u8) {
+		parser_error(p, "Too many local variables in function.")
+		return
+	}
+	local := &compiler.locals[compiler.local_count]
+	compiler.local_count += 1
+	local.name = name
+	local.depth = -1
+}

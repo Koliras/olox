@@ -33,10 +33,14 @@ disassemble_instruction :: proc(c: ^Chunk, offset: int) -> int {
 		return simple_instruction("OP_POP", offset)
 	case .Get_Global:
 		return constant_instruction("OP_GET_GLOBAL", c, offset)
+	case .Get_Local:
+		return byte_instruction("OP_GET_LOCAL", c, offset)
 	case .Define_Global:
 		return constant_instruction("OP_DEFINE_GLOBAL", c, offset)
 	case .Set_Global:
 		return constant_instruction("OP_SET_GLOBAL", c, offset)
+	case .Set_Local:
+		return byte_instruction("OP_SET_LOCAL", c, offset)
 	case .Equal:
 		return simple_instruction("OP_EQUAL", offset)
 	case .Greater:
@@ -78,3 +82,8 @@ constant_instruction :: proc(name: string, chunk: ^Chunk, offset: int) -> int {
 	return offset + 2
 }
 
+byte_instruction::proc(name: string, chunk: ^Chunk, offset: int) -> int {
+	slot := chunk.code[offset + 1]
+	fmt.printf("%-16s %4d\n", name, slot)
+	return offset + 2
+}
