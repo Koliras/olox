@@ -171,6 +171,24 @@ parser_emit_constant :: proc(p: ^Parser, val: Value) {
 	parser_emit_bytes(p, cast(byte)Op_Code.Constant, parser_make_constant(p, val))
 }
 
+parser_emit_jump :: proc(p: ^Parser, instruction: byte) -> int {
+	parser_emit_byte(p, instruction)
+	parser_emit_byte(p, 0xff)
+	parser_emit_byte(p, 0xff)
+	return p.chunk.count - 2
+}
+
+parser_patch_jump :: proc(p: ^Parser, offset: int) {
+	// -2 to adjust for the bytecode for the jump offset itself.
+	jump := p.chunk.count - offset - 2
+	if jump > int(max(u16)) {
+		parser_error(p, "Too much code to jump over.")
+	}
+
+	p.chunk.code[offset] = u8(jump >> 8) & 0xff
+	p.chunk.code[offset + 1] = u8(jump) & 0xff
+}
+
 parser_make_constant :: proc(p: ^Parser, val: Value) -> byte {
 	chunk := p.chunk
 	const := chunk_add_const(chunk, val)
@@ -316,6 +334,8 @@ parser_declaration :: proc(p: ^Parser) {
 parser_statement :: proc(p: ^Parser) {
 	if parser_match(p, .Print) {
 		parser_print_statement(p)
+	} else if parser_match(p, .If) {
+		parser_if_statement(p)
 	} else if parser_match(p, .Left_Brace) {
 		scope_begin()
 		parser_block(p)
@@ -336,6 +356,27 @@ parser_expression_statement :: proc(p: ^Parser) {
 	parser_consume(p, .Semicolon, "Expect ';' after expression.")
 	parser_emit_byte(p, cast(byte)Op_Code.Pop)
 }
+
+parser_if_statement :: proc(p: ^Parser) {
+	parser_consume(p, .Left_Paren, "Expect '(' after 'if'.")
+	parser_expression(p)
+	parser_consume(p, .Right_Paren, "Expect ')' after condition.")
+
+	then_jump := parser_emit_jump(p, cast(byte)Op_Code.Jump_If_False)
+	parser_emit_byte(p, cast(byte)Op_Code.Pop)
+	parser_statement(p)
+
+	else_jump := parser_emit_jump(p, cast(byte)Op_Code.Jump)
+
+	parser_patch_jump(p, then_jump)
+	parser_emit_byte(p, cast(byte)Op_Code.Pop)
+
+	if parser_match(p, .Else) {
+		parser_statement(p)
+	}
+	parser_patch_jump(p, else_jump)
+}
+
 
 parser_synchronize :: proc(p: ^Parser) {
 	p.panic_mode = false
@@ -376,7 +417,7 @@ parser_parse_variable :: proc(p: ^Parser, error_message: string) -> byte {
 }
 
 parser_declare_variable :: proc(p: ^Parser) {
-	if compiler.scope_depth > 0 do return
+	if compiler.scope_depth == 0 do return
 
 	name := &p.previous
 	for i := compiler.local_count - 1; i >= 0; i -= 1 {

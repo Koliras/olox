@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:slice"
 
 STACK_MAX :: 256
 
@@ -144,7 +145,7 @@ vm_run :: proc() -> Interpret_Error {
 
 	read_byte :: #force_inline proc() -> byte {
 		instruction := (cast(^byte)vm.ip)^
-		vm.ip = cast([^]byte)(uintptr(vm.ip) + 1)
+		vm.ip = &vm.ip[1]
 		return instruction
 	}
 	read_constant :: #force_inline proc() -> Value {
@@ -152,6 +153,11 @@ vm_run :: proc() -> Interpret_Error {
 	}
 	read_string :: #force_inline proc() -> ^Object_String {
 		return object_as_string(read_constant())
+	}
+	read_short :: #force_inline proc() -> u16 {
+		vm.ip = &vm.ip[2]
+		instruction := u16(vm.ip[-2]) << 8 | u16(vm.ip[-1])
+		return instruction
 	}
 
 	get_numbers :: #force_inline proc() -> (f64, f64, bool) {
@@ -218,7 +224,6 @@ vm_run :: proc() -> Interpret_Error {
 			vm_push(value_bool(values_equal(a, b)))
 		case .Greater:
 			b, a, ok := get_numbers()
-			fmt.println("foo")
 			if !ok do return .Runtime_Error
 			vm_push(value_bool(a > b))
 		case .Less:
@@ -258,6 +263,14 @@ vm_run :: proc() -> Interpret_Error {
 		case .Print:
 			value_print(vm_pop())
 			fmt.printf("\n")
+		case .Jump_If_False:
+			offset := read_short()
+			if value_is_falsey(vm_peek(0)) {
+				vm.ip = &vm.ip[offset]
+			}
+		case .Jump:
+			offset := read_short()
+			vm.ip = &vm.ip[offset]
 		case .Return:
 			return .None
 		}

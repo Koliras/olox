@@ -1,6 +1,7 @@
 package lox
 
 import "core:fmt"
+import "core:slice"
 
 disassemble_chunk :: proc(c: ^Chunk, name: string) {
 	fmt.printfln("== %s ==", name)
@@ -61,6 +62,10 @@ disassemble_instruction :: proc(c: ^Chunk, offset: int) -> int {
 		return simple_instruction("OP_NEGATE", offset)
 	case .Print:
 		return simple_instruction("OP_PRINT", offset)
+	case .Jump:
+		return jump_instruction("OP_JUMP", 1, c, offset)
+	case .Jump_If_False:
+		return jump_instruction("OP_JUMP_IF_FALSE", 1, c, offset)
 	case .Return:
 		return simple_instruction("OP_RETURN", offset)
 	case:
@@ -82,8 +87,14 @@ constant_instruction :: proc(name: string, chunk: ^Chunk, offset: int) -> int {
 	return offset + 2
 }
 
-byte_instruction::proc(name: string, chunk: ^Chunk, offset: int) -> int {
+byte_instruction :: proc(name: string, chunk: ^Chunk, offset: int) -> int {
 	slot := chunk.code[offset + 1]
 	fmt.printf("%-16s %4d\n", name, slot)
 	return offset + 2
+}
+
+jump_instruction :: proc(name: string, sign: int, chunk: ^Chunk, offset: int) -> int {
+	jump := slice.to_type(chunk.code[offset + 1:offset + 3], u16)
+	fmt.printf("%-16s %4d -> %d\n", name, offset, offset + 3 + sign * int(jump))
+	return offset + 3
 }

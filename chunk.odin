@@ -21,6 +21,8 @@ Op_Code :: enum u8 {
 	Not,
 	Negate,
 	Print,
+	Jump_If_False,
+	Jump,
 	Return,
 }
 
