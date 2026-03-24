@@ -4,7 +4,6 @@ import "base:runtime"
 import "core:fmt"
 import "core:mem"
 import "core:os"
-import "core:slice"
 
 STACK_MAX :: 256
 
