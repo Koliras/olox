@@ -89,7 +89,7 @@ PARSER_RULES: [Token_Type]Parse_Rule = {
 	.Identifier    = {parser_variable, nil, .None},
 	.String        = {parser_string, nil, .None},
 	.Number        = {parser_number, nil, .None},
-	.And           = {nil, nil, .None},
+	.And           = {nil, parser_and, .And},
 	.Class         = {nil, nil, .None},
 	.Else          = {nil, nil, .None},
 	.False         = {parser_literal, nil, .None},
@@ -97,7 +97,7 @@ PARSER_RULES: [Token_Type]Parse_Rule = {
 	.Fun           = {nil, nil, .None},
 	.If            = {nil, nil, .None},
 	.Nil           = {parser_literal, nil, .None},
-	.Or            = {nil, nil, .None},
+	.Or            = {nil, parser_or, .Or},
 	.Print         = {nil, nil, .None},
 	.Return        = {nil, nil, .None},
 	.Super         = {nil, nil, .None},
@@ -355,6 +355,26 @@ parser_expression_statement :: proc(p: ^Parser) {
 	parser_expression(p)
 	parser_consume(p, .Semicolon, "Expect ';' after expression.")
 	parser_emit_byte(p, cast(byte)Op_Code.Pop)
+}
+
+parser_and :: proc(p: ^Parser, can_assign: bool) {
+	end_jump := parser_emit_jump(p, cast(byte)Op_Code.Jump_If_False)
+
+	parser_emit_byte(p, cast(byte)Op_Code.Pop)
+	parser_parse_precedence(p, .And)
+
+	parser_patch_jump(p, end_jump)
+}
+
+parser_or :: proc(p: ^Parser, can_assign: bool) {
+	else_jump := parser_emit_jump(p, cast(byte)Op_Code.Jump_If_False)
+	end_jump := parser_emit_jump(p, cast(byte)Op_Code.Jump)
+
+	parser_patch_jump(p, else_jump)
+	parser_emit_byte(p, cast(byte)Op_Code.Pop)
+
+	parser_parse_precedence(p, .Or)
+	parser_patch_jump(p, end_jump)
 }
 
 parser_if_statement :: proc(p: ^Parser) {

@@ -1,6 +1,8 @@
 var breakfast = "beignets";
 var beverage = "cafe au lait";
+var condition1 = false;
+var condition2 = true;
 
-if (true) {
+if (condition1 or condition2) {
     print breakfast;
 }
