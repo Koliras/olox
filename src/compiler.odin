@@ -336,6 +336,8 @@ parser_statement :: proc(p: ^Parser) {
 		parser_print_statement(p)
 	} else if parser_match(p, .If) {
 		parser_if_statement(p)
+	} else if parser_match(p, .While) {
+		parser_while_statement(p)
 	} else if parser_match(p, .Left_Brace) {
 		scope_begin()
 		parser_block(p)
@@ -397,6 +399,32 @@ parser_if_statement :: proc(p: ^Parser) {
 	parser_patch_jump(p, else_jump)
 }
 
+parser_while_statement :: proc(p: ^Parser) {
+	loop_start := p.chunk.count
+	parser_consume(p, .Left_Paren, "Expect '(' after 'while'.")
+	parser_expression(p)
+	parser_consume(p, .Right_Paren, "Expect ')' after condition.")
+
+	exit_jump := parser_emit_jump(p, cast(byte)Op_Code.Jump_If_False)
+	parser_emit_byte(p, cast(byte)Op_Code.Pop)
+	parser_statement(p)
+	parser_emit_loop(p, loop_start)
+
+	parser_patch_jump(p, exit_jump)
+	parser_emit_byte(p, cast(byte)Op_Code.Pop)
+}
+
+parser_emit_loop :: proc(p: ^Parser, loop_start: int) {
+	parser_emit_byte(p, cast(byte)Op_Code.Loop)
+
+	offset := p.chunk.count - loop_start + 2
+	if offset > int(max(u16)) {
+		parser_error(p, "Loop body too large")
+	}
+
+	parser_emit_byte(p, byte(offset >> 8) & 0xff)
+	parser_emit_byte(p, byte(offset) & 0xff)
+}
 
 parser_synchronize :: proc(p: ^Parser) {
 	p.panic_mode = false
@@ -554,3 +582,4 @@ parser_add_local :: proc(p: ^Parser, name: Token) {
 	local.name = name
 	local.depth = -1
 }
+

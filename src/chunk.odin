@@ -23,6 +23,7 @@ Op_Code :: enum u8 {
 	Print,
 	Jump_If_False,
 	Jump,
+	Loop,
 	Return,
 }
 
@@ -59,4 +60,3 @@ chunk_add_const :: proc(c: ^Chunk, val: Value) -> int {
 	value_array_write(&c.constants, val)
 	return c.constants.count - 1
 }
-

@@ -270,6 +270,9 @@ vm_run :: proc() -> Interpret_Error {
 		case .Jump:
 			offset := read_short()
 			vm.ip = &vm.ip[offset]
+		case .Loop:
+			offset := read_short()
+			vm.ip = &vm.ip[-cast(int)offset]
 		case .Return:
 			return .None
 		}

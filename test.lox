@@ -1,8 +1,6 @@
-var breakfast = "beignets";
-var beverage = "cafe au lait";
-var condition1 = false;
-var condition2 = true;
+var i = 0;
 
-if (condition1 or condition2) {
-    print breakfast;
+while (i < 5) {
+    print i;
+    i = i + 1;
 }

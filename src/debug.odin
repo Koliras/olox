@@ -66,6 +66,8 @@ disassemble_instruction :: proc(c: ^Chunk, offset: int) -> int {
 		return jump_instruction("OP_JUMP", 1, c, offset)
 	case .Jump_If_False:
 		return jump_instruction("OP_JUMP_IF_FALSE", 1, c, offset)
+	case .Loop:
+		return jump_instruction("OP_LOOP", -1, c, offset)
 	case .Return:
 		return simple_instruction("OP_RETURN", offset)
 	case:
@@ -98,3 +100,4 @@ jump_instruction :: proc(name: string, sign: int, chunk: ^Chunk, offset: int) ->
 	fmt.printf("%-16s %4d -> %d\n", name, offset, offset + 3 + sign * int(jump))
 	return offset + 3
 }
+
