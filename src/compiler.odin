@@ -1,6 +1,5 @@
 package lox
 
-import clang "core:c"
 import "core:fmt"
 import "core:mem"
 import os_old "core:os"
@@ -192,7 +191,7 @@ parser_patch_jump :: proc(p: ^Parser, offset: int) {
 parser_make_constant :: proc(p: ^Parser, val: Value) -> byte {
 	chunk := p.chunk
 	const := chunk_add_const(chunk, val)
-	if const > int(clang.UINT8_MAX) {
+	if const > int(max(u8)) {
 		parser_error(p, "Too many constants in one chunk.")
 		return 0
 	}
