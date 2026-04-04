@@ -337,6 +337,8 @@ parser_statement :: proc(p: ^Parser) {
 		parser_if_statement(p)
 	} else if parser_match(p, .While) {
 		parser_while_statement(p)
+	} else if parser_match(p, .For) {
+		parser_for_statement(p)
 	} else if parser_match(p, .Left_Brace) {
 		scope_begin()
 		parser_block(p)
@@ -423,6 +425,49 @@ parser_emit_loop :: proc(p: ^Parser, loop_start: int) {
 
 	parser_emit_byte(p, byte(offset >> 8) & 0xff)
 	parser_emit_byte(p, byte(offset) & 0xff)
+}
+
+parser_for_statement :: proc(p: ^Parser) {
+	scope_begin()
+
+	parser_consume(p, .Left_Paren, "Expect '(' after 'for'.")
+	if parser_match(p, .Semicolon) {
+	} else if parser_match(p, .Var) {
+		parser_var_declaration(p)
+	} else {
+		parser_expression(p)
+	}
+	loop_start := p.chunk.count
+	exit_jump := -1
+	if !parser_match(p, .Semicolon) {
+		parser_expression(p)
+		parser_consume(p, .Semicolon, "Expect ';' after loop condition.")
+
+		exit_jump = parser_emit_jump(p, cast(byte)Op_Code.Jump_If_False)
+		parser_emit_byte(p, cast(byte)Op_Code.Pop)
+	}
+
+	if !parser_match(p, .Right_Paren) {
+		body_jump := parser_emit_jump(p, cast(byte)Op_Code.Jump)
+		increment_start := p.chunk.count
+		parser_expression(p)
+		parser_emit_byte(p, cast(byte)Op_Code.Pop)
+		parser_consume(p, .Right_Paren, "Expect ')' after for clauses.")
+
+		parser_emit_loop(p, loop_start)
+		loop_start = increment_start
+		parser_patch_jump(p, body_jump)
+	}
+
+	parser_statement(p)
+	parser_emit_loop(p, loop_start)
+
+	if exit_jump != -1 {
+		parser_patch_jump(p, exit_jump)
+		parser_emit_byte(p, cast(byte)Op_Code.Pop)
+	}
+
+	scope_end(p)
 }
 
 parser_synchronize :: proc(p: ^Parser) {
